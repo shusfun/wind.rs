@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Windsurf Rust + React 新项目窗口交接</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f0e7;
+      --paper: #fffdf8;
+      --ink: #17211c;
+      --muted: #657067;
+      --line: #d7cebd;
+      --strong: #123a2d;
+      --accent: #a72f22;
+      --blue: #276c87;
+      --green: #286f4b;
+      --amber: #8d6500;
+      --soft: #f8e4dc;
+      --shadow: 0 18px 48px rgba(39, 33, 24, 0.12);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(90deg, rgba(23, 33, 28, 0.045) 1px, transparent 1px) 0 0 / 40px 40px,
+        linear-gradient(180deg, rgba(23, 33, 28, 0.035) 1px, transparent 1px) 0 0 / 40px 40px,
+        var(--bg);
+      font-family: ui-serif, Georgia, "Times New Roman", "Noto Serif SC", serif;
+      line-height: 1.72;
+    }
+
+    .shell {
+      width: min(1220px, calc(100% - 36px));
+      margin: 0 auto;
+      padding: 34px 0 64px;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 320px;
+      gap: 28px;
+      padding: 34px 0 26px;
+      border-bottom: 2px solid var(--ink);
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--accent);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 880px;
+      margin: 0;
+      color: var(--strong);
+      font-size: clamp(36px, 6vw, 76px);
+      line-height: 0.98;
+      letter-spacing: 0;
+    }
+
+    .lead {
+      max-width: 860px;
+      margin: 18px 0 0;
+      color: #314039;
+      font-size: 18px;
+    }
+
+    .toc,
+    .card,
+    .note,
+    table {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+    }
+
+    .toc {
+      align-self: end;
+      padding: 16px;
+    }
+
+    .toc h2 {
+      margin: 0 0 8px;
+      font-size: 16px;
+    }
+
+    .toc a {
+      display: block;
+      padding: 5px 0;
+      color: var(--blue);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+      font-size: 14px;
+    }
+
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: 26px 0 0;
+    }
+
+    .meta div {
+      padding: 14px;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+    }
+
+    .meta strong,
+    .tag {
+      display: block;
+      color: var(--accent);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    .meta span {
+      display: block;
+      margin-top: 6px;
+      font-weight: 700;
+    }
+
+    main {
+      display: grid;
+      gap: 22px;
+      margin-top: 28px;
+    }
+
+    section {
+      scroll-margin-top: 20px;
+    }
+
+    .card {
+      padding: 24px;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      color: var(--strong);
+      font-size: 30px;
+      line-height: 1.1;
+    }
+
+    h3 {
+      margin: 22px 0 8px;
+      color: #23382f;
+      font-size: 20px;
+    }
+
+    p {
+      margin: 0 0 12px;
+    }
+
+    ul,
+    ol {
+      margin: 8px 0 0;
+      padding-left: 22px;
+    }
+
+    li {
+      margin: 7px 0;
+    }
+
+    code {
+      padding: 2px 6px;
+      border: 1px solid var(--line);
+      background: #f7efe4;
+      color: #15221c;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      margin: 12px 0 0;
+      padding: 14px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      background: #1b211e;
+      color: #f7f3ea;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      box-shadow: none;
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--strong);
+      background: #f2eadf;
+      font-size: 13px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .note {
+      padding: 14px 16px;
+      border-left: 5px solid var(--blue);
+      box-shadow: none;
+    }
+
+    .warn {
+      border-left-color: var(--accent);
+      background: var(--soft);
+    }
+
+    .ok {
+      border-left-color: var(--green);
+    }
+
+    .status {
+      display: inline-block;
+      margin: 2px 6px 2px 0;
+      padding: 3px 8px;
+      border: 1px solid var(--line);
+      background: #f7efe4;
+      color: var(--strong);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
+    @media (max-width: 860px) {
+      header,
+      .grid,
+      .meta {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div>
+        <p class="eyebrow">2026-05-21 / window handoff</p>
+        <h1>Windsurf Rust + React 新项目交接文档</h1>
+        <p class="lead">这份文档用于换窗口继续开发，记录本窗口的真实决策、已完成代码、参考项目地图、需要提交到 GitHub 的内容、不能提交的敏感内容，以及下一步继续做真实 Windsurf Engine 的路线。</p>
+      </div>
+      <nav class="toc" aria-label="目录">
+        <h2>目录</h2>
+        <a href="#position">项目定位</a>
+        <a href="#done">本窗口已完成</a>
+        <a href="#engine">WindsurfEngine 状态</a>
+        <a href="#references">参考项目地图</a>
+        <a href="#download">必须下载与本地配置</a>
+        <a href="#submit">GitHub 提交清单</a>
+        <a href="#dont-submit">禁止提交内容</a>
+        <a href="#next">下一窗口 TODO</a>
+      </nav>
+    </header>
+
+    <div class="meta">
+      <div><strong>后端端口</strong><span>3003</span></div>
+      <div><strong>前端端口</strong><span>Vite 9527</span></div>
+      <div><strong>当前数据目录</strong><span><code>.tmp/dev-data-login</code></span></div>
+      <div><strong>核心边界</strong><span>sub2api 坚决不改</span></div>
+    </div>
+
+    <main>
+      <section id="position" class="card">
+        <h2>项目定位</h2>
+        <p>这是一个新项目，不是给旧项目做兼容补丁。目标是以 <code>Rust 后端 + React 前端</code> 重构 WindsurfAPI 的核心能力，让 <code>sub2api</code> 后续只通过 <code>127.0.0.1</code> 调本项目提供的上游接口。</p>
+        <div class="note ok">
+          <p><strong>关键原则：</strong>不改 <code>sub2api</code>；不引入 Node sidecar；协议层不要闭门自研，必须参考 <code>dwgx/WindsurfAPI</code> 原版；前端 UX 尽量复刻原版管理台，但实现使用当前 React/Tailwind v4 工程。</p>
+        </div>
+        <h3>长期方向</h3>
+        <ul>
+          <li>后端用 Rust 承担账号池、并发控制、粘性会话、限流、真实 Windsurf LS 调用、兼容 OpenAI/Anthropic API。</li>
+          <li>前端用 React 管理账号、代理、批量登录、调用日志、容量参数、账号测试。</li>
+          <li>生产环境由 Rust 托管构建后的前端静态文件；开发环境前端单独跑 Vite 热更新。</li>
+        </ul>
+      </section>
+
+      <section id="done" class="card">
+        <h2>本窗口已完成</h2>
+        <table>
+          <thead><tr><th>模块</th><th>状态</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td>前端端口</td><td><span class="status">已定</span></td><td>开发环境使用 <code>http://127.0.0.1:9527</code>，后端 <code>3003</code>。</td></tr>
+            <tr><td>登录 key</td><td><span class="status">已处理</span></td><td>忘记管理 key 时，已清当前库 <code>admin_key_hash</code> 和 <code>admin_sessions</code>，刷新前端重新走 setup。</td></tr>
+            <tr><td>密码输入框</td><td><span class="status">已完成</span></td><td>新增 <code>admin-ui/src/components/SecretInput.tsx</code>，登录页、setup 页、添加账号弹窗密码输入框支持显示/隐藏。</td></tr>
+            <tr><td>账号体系前端</td><td><span class="status">已推进</span></td><td>账号列表、标签显示、操作下拉、余额/等级/模型展示已多轮对齐，仍需继续精修模型和余额的真实数据来源。</td></tr>
+            <tr><td>账号调度</td><td><span class="status">已推进</span></td><td>已落地容量控制、粘性会话、限流相关基础结构，后续要继续和真实 Engine 结合压测。</td></tr>
+            <tr><td>账号测试</td><td><span class="status">已推进</span></td><td>账号测试页支持模型下拉、测试内容保存、流式输出方向；后端已改为接真实 Engine 初版。</td></tr>
+            <tr><td>WindsurfEngine</td><td><span class="status">初版</span></td><td>Rust 版已接 <code>h2</code>、<code>bytes</code>、<code>tokio::process</code>，实现 LS 启动、warmup、Start/Send/Poll 基础 Cascade。</td></tr>
+          </tbody>
+        </table>
+        <h3>已验证命令</h3>
+        <pre><code>cargo fmt --all
+cargo check -p windsurf-rs-server
+cd admin-ui &amp;&amp; pnpm build</code></pre>
+      </section>
+
+      <section id="engine" class="card">
+        <h2>WindsurfEngine 当前状态</h2>
+        <p>当前核心文件是 <code>crates/server/src/engine/mod.rs</code> 和 <code>crates/server/src/engine/proto.rs</code>。这不是最终完成版，但已经不是占位输出。</p>
+        <div class="grid">
+          <div class="note ok">
+            <h3>已实现</h3>
+            <ul>
+              <li>从设置读取 <code>lsBinaryPath</code>、<code>lsDataDir</code>、<code>lsMaxInstances</code>、轮询/超时参数。</li>
+              <li>使用 <code>tokio::process::Command</code> 启动 Windsurf language server。</li>
+              <li>使用 <code>h2</code> 直连本地 LS，手工 gRPC frame。</li>
+              <li>实现 <code>InitializeCascadePanelState</code>、<code>AddTrackedWorkspace</code>、<code>UpdateWorkspaceTrust</code>、<code>Heartbeat</code> warmup。</li>
+              <li>实现 <code>StartCascade</code>、<code>SendUserCascadeMessage</code>、<code>GetCascadeTrajectorySteps</code>、<code>GetCascadeTrajectory</code>。</li>
+              <li>LS 池按账号 key + 代理隔离，避免多账号共享同一 LS session。</li>
+              <li><code>/admin/account-test</code> 和 <code>/v1/messages</code> 已改走共享 <code>WindsurfEngine</code>。</li>
+            </ul>
+          </div>
+          <div class="note warn">
+            <h3>仍需补齐</h3>
+            <ul>
+              <li>当前只做 Cascade 基础路径；Raw legacy 未做。</li>
+              <li>图片输入未做。</li>
+              <li>native tool bridge 未做。</li>
+              <li>token usage 还不是原版完整逻辑。</li>
+              <li>当前 <code>cascade_stream</code> 内部仍偏批量收集后 yield，后续要改成边 poll 边 yield。</li>
+              <li>settings 里的 <code>lsBinaryPath</code> 当前随后端启动加载，改设置后需要重启后端。</li>
+              <li>还没有跑真实 Windsurf 官方请求验证；这是外部生产 API 调用，需要操作者确认。</li>
+            </ul>
+          </div>
+        </div>
+        <h3>关键实现判断</h3>
+        <ul>
+          <li>不要把 LS Engine 做成 Node sidecar。当前方向是 Rust 后端直接管理 LS 进程与 gRPC。</li>
+          <li>不要重新发明协议。字段号、调用顺序、stall/retry 策略都以原版 <code>WindsurfAPI</code> 为真相源。</li>
+          <li>4h4g 服务器上不能为每个请求无限起 LS。要靠账号池、并发控制、LS 池上限、粘性会话、队列和限流共同控制。</li>
+        </ul>
+      </section>
+
+      <section id="references" class="card">
+        <h2>参考项目地图</h2>
+        <p>下一窗口不要重新调研一遍，按这个优先级看。</p>
+        <table>
+          <thead><tr><th>项目</th><th>角色</th><th>重点文件/位置</th><th>使用方式</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>WindsurfAPI/</code></td>
+              <td>协议真相源</td>
+              <td>
+                <code>src/client.js</code>：<code>warmupCascade</code>、<code>cascadeChat</code>、panel retry、stall 判断。<br>
+                <code>src/windsurf.js</code>：protobuf builder/parser、Cascade config、模型字段。<br>
+                <code>src/langserver.js</code>：LS 进程池、代理隔离、端口、数据目录、启动参数。<br>
+                <code>src/grpc.js</code>：HTTP/2 gRPC frame、unary/stream。<br>
+                <code>src/windsurf-api.js</code>：账号状态、模型目录、余额/额度探测。<br>
+                <code>src/handlers/chat.js</code>、<code>messages.js</code>：账号调度和 OpenAI/Anthropic 兼容。
+              </td>
+              <td>必须优先参考，Rust Engine 的协议字段和调用顺序都从这里翻译。</td>
+            </tr>
+            <tr>
+              <td><code>.tmp/CLIProxyAPI/</code></td>
+              <td>调度参考</td>
+              <td>账号池、上游选择、并发控制、失败重试、粘性会话、限流。</td>
+              <td>学调度结构，不照搬 Windsurf 协议。</td>
+            </tr>
+            <tr>
+              <td><code>.tmp/sub2api/</code></td>
+              <td>对接目标</td>
+              <td>provider/upstream 配置、请求格式、流式返回、错误处理。</td>
+              <td>原则是 sub2api 不改，本项目暴露它能接的上游接口。</td>
+            </tr>
+            <tr>
+              <td><code>.tmp/kiro.rs/</code></td>
+              <td>Rust/React 工程参考</td>
+              <td>后端结构、配置、管理台组织、生产托管思路。</td>
+              <td>不是兼容它，只借鉴工程组织。</td>
+            </tr>
+            <tr>
+              <td><code>.tmp/fork-eval/</code></td>
+              <td>fork 补充验证</td>
+              <td>之前拉取的 WindsurfAPI fork/变体。</td>
+              <td>用于判断有没有现成修复，但主线仍以 dwgx/WindsurfAPI 为准。</td>
+            </tr>
+            <tr>
+              <td><code>.tmp/claude-code/</code></td>
+              <td>本地工具包</td>
+              <td><code>@anthropic-ai/claude-code</code> 2.1.88，含 <code>cli.js</code>、<code>cli.js.map</code>、<code>sdk-tools.d.ts</code>、vendor 音频/rg 二进制。</td>
+              <td>不提交到仓库；换环境时按需重新下载或本地复制。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="download" class="card">
+        <h2>必须下载与本地配置</h2>
+        <div class="note warn">
+          <p><strong>Windsurf language server 二进制不要默认随仓库提交。</strong>需要在文档/README 提示使用者下载对应平台版本，然后在管理台 settings 或数据库里配置 <code>lsBinaryPath</code>。</p>
+        </div>
+        <h3>本地已见到的二进制</h3>
+        <ul>
+          <li><code>WindsurfAPI/.local/bin/language_server_macos_x64</code></li>
+        </ul>
+        <p>注意本机如果是 Apple Silicon，<code>macos_x64</code> 可能需要 Rosetta 或换 arm64 版本。服务器通常需要 Linux x64 版本。</p>
+        <h3>后端相关设置</h3>
+        <table>
+          <thead><tr><th>设置项</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td><code>lsBinaryPath</code></td><td>LS 二进制绝对或相对路径。未配置时真实调用会返回“请先配置 LS 二进制路径”。</td></tr>
+            <tr><td><code>lsDataDir</code></td><td>LS 数据目录，默认使用后端数据目录下的 <code>ls</code>。</td></tr>
+            <tr><td><code>lsMaxInstances</code></td><td>LS 进程池上限，默认 20。4h4g 机器必须谨慎设置。</td></tr>
+            <tr><td><code>cascadePollIntervalMs</code></td><td>Cascade 轮询间隔，默认 500ms。</td></tr>
+            <tr><td><code>cascadeMaxWaitMs</code></td><td>单次 Cascade 最大等待，默认 600000ms。</td></tr>
+            <tr><td><code>cascadeWarmStallMs</code></td><td>有输出后长时间无增长的接受/停止阈值，默认 45000ms。</td></tr>
+          </tbody>
+        </table>
+        <h3>开发启动</h3>
+        <pre><code># 后端
+cargo run -p windsurf-rs-server -- --host 127.0.0.1 --port 3003 --data-dir .tmp/dev-data-login
+
+# 前端
+cd admin-ui
+pnpm dev --host 127.0.0.1 --port 9527</code></pre>
+      </section>
+
+      <section id="submit" class="card">
+        <h2>GitHub 提交清单</h2>
+        <p>当前目录之前检查过不是 git 仓库，真正提交前要确认目标仓库位置或初始化仓库。这里先列应该纳入版本管理的内容。</p>
+        <h3>应该提交</h3>
+        <ul>
+          <li><code>crates/server/src/engine/mod.rs</code></li>
+          <li><code>crates/server/src/engine/proto.rs</code></li>
+          <li><code>crates/server/src/main.rs</code></li>
+          <li><code>crates/server/Cargo.toml</code> 与对应 <code>Cargo.lock</code></li>
+          <li><code>admin-ui/src/components/SecretInput.tsx</code></li>
+          <li><code>admin-ui/src/pages/LoginPage.tsx</code></li>
+          <li><code>admin-ui/src/pages/SetupPage.tsx</code></li>
+          <li><code>admin-ui/src/pages/AccountsPage.tsx</code></li>
+          <li><code>admin-ui/src/styles.css</code></li>
+          <li><code>docs/window-handoff-2026-05-21.html</code></li>
+          <li><code>docs/rust-react-rewrite-context.html</code> 和 <code>docs/cpa-sub2api-rust-backend-research.html</code> 如果它们尚未提交。</li>
+        </ul>
+        <h3>不随仓库提交的参考项目</h3>
+        <p><code>WindsurfAPI/</code>、<code>.tmp/CLIProxyAPI/</code>、<code>.tmp/sub2api/</code>、<code>.tmp/kiro.rs/</code>、<code>.tmp/fork-eval/</code>、<code>.tmp/claude-code/</code> 都是本地调研或工具参考，不随 <code>wind.rs</code> 新项目仓库提交。换机器或换窗口时按“参考项目地图”重新 clone、下载或复制到同名路径即可。</p>
+        <h3>.tmp/claude-code 本地说明</h3>
+        <ul>
+          <li>当前约 98M，含 <code>cli.js.map</code> 约 57M、<code>cli.js</code> 约 12M、<code>vendor/ripgrep/x64-linux/rg</code> 约 5.4M，以及多平台音频/rg vendor。</li>
+          <li>不提交的原因：体积大，且属于可重新获取的工具包，不应污染新项目仓库历史。</li>
+          <li>如未来确需纳入仓库，优先考虑 Git LFS 或单独 release artifact。</li>
+        </ul>
+        <pre><code># 本地体积检查
+find .tmp/claude-code -type f -size +50M -exec ls -lh {} \;</code></pre>
+      </section>
+
+      <section id="dont-submit" class="card">
+        <h2>禁止提交内容</h2>
+        <div class="note warn">
+          <p>当前 <code>.gitignore</code> 只有 <code>.ace-tool/</code>，明显不够。下一步进入 git 仓库后应补充忽略规则，避免误传账号、数据库、日志和构建产物。</p>
+        </div>
+        <ul>
+          <li><code>.env.local</code>：里面有远端日志 SSH 密码，不能提交。</li>
+          <li><code>.tmp/dev-data*</code>、<code>.tmp/verify-data</code>、<code>.tmp/remote-*</code>：含 SQLite、远端日志、运行数据，不能提交。</li>
+          <li><code>WindsurfAPI/.local/data/accounts.json</code>、<code>WindsurfAPI/.local/data/logs/*</code>：可能含账号与调用日志，不能提交。</li>
+          <li><code>admin-ui/node_modules</code>、<code>target</code>、<code>admin-ui/dist</code>：构建/依赖产物，一般不提交；生产托管如要提交 dist 需单独确认。</li>
+          <li>任何 Windsurf API key、邮箱密码、Auth Token、Firebase token、session token、代理用户名密码。</li>
+        </ul>
+        <h3>建议补充 .gitignore</h3>
+        <pre><code>.env
+.env.*
+!.env.example
+target/
+admin-ui/node_modules/
+admin-ui/dist/
+.tmp/*
+.tmp/dev-data*/
+.tmp/verify-data/
+.tmp/remote-*/
+WindsurfAPI/.local/data/
+WindsurfAPI/.tmp/
+*.sqlite3
+*.db
+*.log
+.DS_Store</code></pre>
+      </section>
+
+      <section id="next" class="card">
+        <h2>下一窗口 TODO</h2>
+        <ol>
+          <li>确认当前目录的目标 Git 仓库。如果仍不是 git 仓库，先确认是否要初始化，或切到正确 repo。</li>
+          <li>补充 <code>.gitignore</code>，明确 <code>.tmp/claude-code/</code> 仅本地保留，不提交。</li>
+          <li>补 README/文档说明 LS 二进制下载、放置和 <code>lsBinaryPath</code> 配置。</li>
+          <li>启动后端与前端，进入 setup 设置新管理 key。</li>
+          <li>在 settings 配置 LS 二进制路径，重启后端。</li>
+          <li>用管理台账号测试发真实请求，记录原始输入、流式返回、错误和 LS 日志。</li>
+          <li>如果真实请求失败，优先对照 <code>WindsurfAPI/src/client.js</code> 的 panel retry、untrusted workspace、expired cascade 恢复逻辑。</li>
+          <li>把 <code>cascade_stream</code> 改成真正边 poll 边 yield，避免长请求到结束才输出。</li>
+          <li>补模型目录和账号 probe：参考 <code>WindsurfAPI/src/windsurf-api.js</code>，让模型不是假数据。</li>
+          <li>继续对齐前端账号列表：余额、等级、模型下拉、操作列、列宽、合并展示。</li>
+          <li>围绕 4h4g + 两三百用户目标做容量压测：LS 实例数、队列、账号并发、IP 级限流、模型级限流。</li>
+        </ol>
+        <div class="note ok">
+          <p><strong>下一窗口第一句话建议：</strong>“请读取 <code>docs/window-handoff-2026-05-21.html</code>，按里面的 TODO 继续，不要重新调研。”</p>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,752 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rust + React 重构上下文交接</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f0e7;
+      --paper: #fffdf8;
+      --ink: #18211c;
+      --muted: #667066;
+      --line: #d7cebd;
+      --strong: #123a2d;
+      --accent: #a72f22;
+      --accent-2: #276c87;
+      --soft: #f8e4dc;
+      --green: #286f4b;
+      --amber: #8d6500;
+      --shadow: 0 18px 48px rgba(39, 33, 24, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(90deg, rgba(24, 33, 28, 0.045) 1px, transparent 1px) 0 0 / 40px 40px,
+        linear-gradient(180deg, rgba(24, 33, 28, 0.035) 1px, transparent 1px) 0 0 / 40px 40px,
+        var(--bg);
+      font-family: ui-serif, Georgia, "Times New Roman", "Noto Serif SC", serif;
+      line-height: 1.72;
+    }
+
+    .shell {
+      width: min(1220px, calc(100% - 36px));
+      margin: 0 auto;
+      padding: 34px 0 64px;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 300px;
+      gap: 28px;
+      padding: 34px 0 26px;
+      border-bottom: 2px solid var(--ink);
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--accent);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 860px;
+      margin: 0;
+      color: var(--strong);
+      font-size: clamp(36px, 6vw, 76px);
+      line-height: 0.98;
+      letter-spacing: 0;
+    }
+
+    .lead {
+      max-width: 850px;
+      margin: 18px 0 0;
+      color: #314039;
+      font-size: 18px;
+    }
+
+    .toc {
+      align-self: end;
+      padding: 16px;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+    }
+
+    .toc h2 {
+      margin: 0 0 8px;
+      font-size: 16px;
+    }
+
+    .toc a {
+      display: block;
+      padding: 5px 0;
+      color: var(--accent-2);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+      font-size: 14px;
+    }
+
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin: 26px 0 0;
+    }
+
+    .meta div,
+    .card,
+    .note,
+    table {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+    }
+
+    .meta div {
+      min-height: 82px;
+      padding: 14px 16px;
+    }
+
+    .label {
+      display: block;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .value {
+      display: block;
+      margin-top: 5px;
+      color: var(--ink);
+      font-weight: 700;
+    }
+
+    section {
+      margin-top: 34px;
+      scroll-margin-top: 18px;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      color: var(--strong);
+      font-size: 30px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 0 0 8px;
+      color: var(--ink);
+      font-size: 20px;
+    }
+
+    p {
+      margin: 0 0 12px;
+    }
+
+    ul,
+    ol {
+      margin: 10px 0 0;
+      padding-left: 22px;
+    }
+
+    li {
+      margin: 6px 0;
+    }
+
+    code {
+      padding: 1px 5px;
+      border: 1px solid #dacfb9;
+      border-radius: 3px;
+      background: #fbf5ea;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      overflow: auto;
+      margin: 12px 0 0;
+      padding: 16px;
+      border: 1px solid #28362f;
+      background: #1d241f;
+      color: #edf4ed;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .two {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .card,
+    .note {
+      padding: 18px;
+    }
+
+    .note {
+      border-left: 6px solid var(--accent);
+      background: var(--soft);
+      box-shadow: none;
+    }
+
+    .tagline {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 2px 8px;
+      border: 1px solid var(--line);
+      background: #f3eadb;
+      color: #344139;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+    }
+
+    th,
+    td {
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: #eee4d2;
+      color: var(--strong);
+      font-size: 13px;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .ok {
+      color: var(--green);
+      font-weight: 700;
+    }
+
+    .warn {
+      color: var(--amber);
+      font-weight: 700;
+    }
+
+    .risk {
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    .steps {
+      counter-reset: step;
+      display: grid;
+      gap: 12px;
+    }
+
+    .steps .card {
+      position: relative;
+      padding-left: 58px;
+    }
+
+    .steps .card::before {
+      counter-increment: step;
+      content: counter(step);
+      position: absolute;
+      top: 18px;
+      left: 18px;
+      display: grid;
+      width: 28px;
+      height: 28px;
+      place-items: center;
+      border: 2px solid var(--strong);
+      background: #fff8e9;
+      color: var(--strong);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-weight: 700;
+    }
+
+    footer {
+      margin-top: 34px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    @media (max-width: 960px) {
+      header,
+      .meta,
+      .grid,
+      .two {
+        grid-template-columns: 1fr;
+      }
+
+      .shell {
+        width: min(100% - 24px, 760px);
+      }
+
+      h1 {
+        font-size: 42px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <p class="eyebrow">Context Handoff · 2026-05-21</p>
+        <h1>Rust + React 重构上下文交接</h1>
+        <p class="lead">
+          这份文档用于避免开新窗口后上下文丢失。当前方向已经从修改 WindsurfAPI 后端升级为重做一个 Rust + React 新项目，首版优先打通 sub2api 到 Claude Code 的稳定链路。
+        </p>
+      </div>
+      <nav class="toc" aria-label="目录">
+        <h2>目录</h2>
+        <a href="#decision">当前决策</a>
+        <a href="#references">参考仓库</a>
+        <a href="#apis">首版接口</a>
+        <a href="#frontend">管理台路由</a>
+        <a href="#backend">后端模块</a>
+        <a href="#batch">批量登录</a>
+        <a href="#scheduler">调度器</a>
+        <a href="#implementation">落地进度</a>
+        <a href="#next">下一步</a>
+      </nav>
+    </header>
+
+    <div class="meta">
+      <div>
+        <span class="label">后端</span>
+        <span class="value">Rust + Axum</span>
+      </div>
+      <div>
+        <span class="label">前端</span>
+        <span class="value">React + Vite</span>
+      </div>
+      <div>
+        <span class="label">存储</span>
+        <span class="value">SQLite</span>
+      </div>
+      <div>
+        <span class="label">首版主线</span>
+        <span class="value">Claude Code</span>
+      </div>
+    </div>
+
+    <section id="decision">
+      <h2>当前决策</h2>
+      <div class="grid">
+        <article class="card">
+          <h3>新项目，不是修补</h3>
+          <p>不做旧 WindsurfAPI 的简单兼容翻版。旧项目只作为行为参考和问题样本，不继续在旧单文件 dashboard 上堆功能。</p>
+          <div class="tagline">
+            <span class="tag">Rust</span>
+            <span class="tag">React Router</span>
+            <span class="tag">SQLite</span>
+          </div>
+        </article>
+        <article class="card">
+          <h3>sub2api 不改</h3>
+          <p>新后端要让 sub2api 现有调用方式自然接入。首版优先 Anthropic 兼容接口，而不是 OpenAI Chat Completions。</p>
+          <div class="tagline">
+            <span class="tag">/v1/messages</span>
+            <span class="tag">/v1/models</span>
+          </div>
+        </article>
+        <article class="card">
+          <h3>部署形态</h3>
+          <p>生产为单二进制，Rust 嵌入 React 构建产物；开发环境前后端拆开运行，Vite 热更新代理到 Rust API。</p>
+          <div class="tagline">
+            <span class="tag">Single Binary</span>
+            <span class="tag">Vite Proxy</span>
+          </div>
+        </article>
+      </div>
+
+      <div class="note" style="margin-top: 14px;">
+        <strong>已定边界：</strong>不迁移旧数据；后台只需要 key 登录；不做用户名密码登录；不做多管理员；不做复杂 RBAC；不优先做 Postgres、Docker、OpenAI Chat Completions 或 <code>/v1/responses</code>。
+      </div>
+    </section>
+
+    <section id="references">
+      <h2>本地参考仓库</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>项目</th>
+            <th>路径</th>
+            <th>参考价值</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>WindsurfAPI</td>
+            <td><code>WindsurfAPI/</code></td>
+            <td>行为参考、Windsurf 登录和 LS 调用样本、旧 dashboard 功能清单。</td>
+          </tr>
+          <tr>
+            <td>CPA</td>
+            <td><code>.tmp/CLIProxyAPI/</code></td>
+            <td>账号池调度、冷却、结果反馈、流式转发。</td>
+          </tr>
+          <tr>
+            <td>sub2api</td>
+            <td><code>.tmp/sub2api/</code></td>
+            <td>调用方接口、Claude Code 路由、setup/key 思路。</td>
+          </tr>
+          <tr>
+            <td>kiro.rs</td>
+            <td><code>.tmp/kiro.rs/</code></td>
+            <td>Rust + Axum 后端形态、SSE、Admin API、React 管理台分层。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="two" style="margin-top: 14px;">
+        <article class="card">
+          <h3>CPA 重点文件</h3>
+          <ul>
+            <li><code>.tmp/CLIProxyAPI/sdk/cliproxy/auth/scheduler.go</code></li>
+            <li><code>.tmp/CLIProxyAPI/sdk/cliproxy/auth/conductor.go</code></li>
+            <li><code>.tmp/CLIProxyAPI/sdk/api/handlers/stream_forwarder.go</code></li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>sub2api 重点文件</h3>
+          <ul>
+            <li><code>.tmp/sub2api/backend/internal/server/routes/gateway.go</code></li>
+            <li><code>.tmp/sub2api/backend/internal/service/gateway_service.go</code></li>
+            <li><code>.tmp/sub2api/backend/internal/setup/handler.go</code></li>
+            <li><code>.tmp/sub2api/frontend/src/api/setup.ts</code></li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section id="apis">
+      <h2>首版外部接口</h2>
+      <div class="two">
+        <article class="card">
+          <h3>P0：Claude Code 主线</h3>
+          <ul>
+            <li><code>GET /v1/models</code></li>
+            <li><code>POST /v1/messages</code></li>
+            <li><code>POST /v1/messages/count_tokens</code></li>
+          </ul>
+          <pre><code>sub2api -> Rust 后端 /v1/messages
+  -> 账号调度
+  -> Windsurf LS
+  -> Anthropic Messages SSE/JSON 输出</code></pre>
+        </article>
+        <article class="card">
+          <h3>P1：后续兼容</h3>
+          <ul>
+            <li><code>POST /v1/chat/completions</code></li>
+            <li><code>POST /v1/responses</code></li>
+          </ul>
+          <p>首版重点不是协议面铺满，而是把 Claude Code 的链路做稳定，尤其是 Opus 请求、工具调用和流式结束。</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="frontend">
+      <h2>管理台路由</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>路由</th>
+            <th>用途</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>/setup</code></td>
+            <td>首次初始化，生成或录入管理 key。</td>
+          </tr>
+          <tr>
+            <td><code>/login</code></td>
+            <td>key 登录。</td>
+          </tr>
+          <tr>
+            <td><code>/dashboard</code></td>
+            <td>总览。</td>
+          </tr>
+          <tr>
+            <td><code>/accounts</code></td>
+            <td>账号池、状态、冷却、启停、代理绑定。</td>
+          </tr>
+          <tr>
+            <td><code>/login-jobs</code></td>
+            <td>批量 Windsurf 登录任务、实时进度、随机延迟、失败原因。</td>
+          </tr>
+          <tr>
+            <td><code>/requests</code></td>
+            <td>调用日志、原始输入、LS 原始输出、转换后输出、结束原因。</td>
+          </tr>
+          <tr>
+            <td><code>/proxies</code></td>
+            <td>代理池、检测、绑定关系。</td>
+          </tr>
+          <tr>
+            <td><code>/settings</code></td>
+            <td>模型、调度参数、LS 路径、日志配置。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="note" style="margin-top: 14px;">
+        前端用户可见文案必须使用用户视角表达，不能把研发术语、内部字段、权限分层或实现细节直接渲染到页面。
+      </div>
+    </section>
+
+    <section id="auth">
+      <h2>管理台认证</h2>
+      <div class="steps">
+        <article class="card">
+          <h3>检查初始化</h3>
+          <p><code>GET /setup/status</code> 返回是否需要初始化。初始化完成后禁止再次 setup。</p>
+        </article>
+        <article class="card">
+          <h3>首次设置 key</h3>
+          <p>用户在 <code>/setup</code> 录入或生成管理 key，后端保存 key hash，并写入安装锁。</p>
+        </article>
+        <article class="card">
+          <h3>登录和会话</h3>
+          <p><code>/login</code> 输入 key，后端签发本地管理 session token。管理 API 默认使用 session token。</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="backend">
+      <h2>后端模块建议</h2>
+      <div class="grid">
+        <article class="card"><h3>config</h3><p>端口、数据目录、LS 路径、日志配置、调度参数。</p></article>
+        <article class="card"><h3>db</h3><p>SQLite 连接、迁移、事务。</p></article>
+        <article class="card"><h3>auth</h3><p>setup、admin key hash、session token。</p></article>
+        <article class="card"><h3>accounts</h3><p>Windsurf 账号、状态、冷却、失败计数、代理绑定。</p></article>
+        <article class="card"><h3>proxies</h3><p>代理池、检测结果、账号绑定。</p></article>
+        <article class="card"><h3>scheduler</h3><p>账号选择、租约、并发限制、冷却、结果反馈。</p></article>
+        <article class="card"><h3>login_jobs</h3><p>批量登录任务，严格串行、随机延迟、失败退避、SSE 进度。</p></article>
+        <article class="card"><h3>ls_manager</h3><p>Windsurf language server 生命周期、按账号启动/复用、健康检查、重启。</p></article>
+        <article class="card"><h3>anthropic</h3><p><code>/v1/messages</code> 请求/响应类型、SSE 输出、错误格式。</p></article>
+        <article class="card"><h3>trace</h3><p>请求证据：原始输入、账号选择、LS 原始输出、转换后输出、结束原因。</p></article>
+        <article class="card"><h3>web</h3><p>开发使用 Vite，生产使用 <code>tower-http</code> 托管 React 构建产物。</p></article>
+      </div>
+    </section>
+
+    <section id="sqlite">
+      <h2>SQLite 数据对象</h2>
+      <div class="two">
+        <article class="card">
+          <h3>首版表</h3>
+          <ul>
+            <li><code>settings</code></li>
+            <li><code>admin_sessions</code></li>
+            <li><code>accounts</code></li>
+            <li><code>proxies</code></li>
+            <li><code>login_jobs</code></li>
+            <li><code>login_job_events</code></li>
+            <li><code>request_traces</code></li>
+            <li><code>request_trace_chunks</code></li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>证据要求</h3>
+          <p><code>request_traces</code> 必须能定位“输出一直不停”的原因。每条请求至少记录请求 ID、模型、stream、选中账号、开始时间、结束时间、结束原因、错误摘要。</p>
+          <p>流式证据需要分层记录：客户端原始请求、LS 原始事件、转换后下游事件。</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="batch">
+      <h2>批量登录要求</h2>
+      <div class="grid">
+        <article class="card">
+          <h3>执行方式</h3>
+          <p>批量任务严格串行，每个账号之间随机延迟，支持停止剩余任务。</p>
+        </article>
+        <article class="card">
+          <h3>前端进度</h3>
+          <p>实时显示当前账号、总进度、等待倒计时、成功数、失败数和失败原因。</p>
+        </article>
+        <article class="card">
+          <h3>默认延迟</h3>
+          <p>成功或普通失败后 15-45 秒；风控或限频类失败后 60-180 秒；可在 settings 中调整。</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="scheduler">
+      <h2>调度器要求</h2>
+      <div class="two">
+        <article class="card">
+          <h3>账号状态</h3>
+          <ul>
+            <li><span class="ok">ready</span>：可被选择。</li>
+            <li><span class="warn">cooldown</span>：临时冷却。</li>
+            <li><span class="warn">blocked</span>：等待人工或后台恢复。</li>
+            <li><span class="risk">disabled</span>：禁用。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>调度行为</h3>
+          <ul>
+            <li>按模型过滤可用账号。</li>
+            <li>优先级高的账号先参与选择。</li>
+            <li>同优先级轮询。</li>
+            <li>每次请求拿到租约，结束后释放。</li>
+            <li>失败通过 result reporter 更新账号状态。</li>
+            <li>同一请求内失败账号加入排除集。</li>
+          </ul>
+        </article>
+      </div>
+      <div class="card" style="margin-top: 14px;">
+        <h3>错误冷却建议</h3>
+        <ul>
+          <li>401 / 403：长冷却。</li>
+          <li>429 / 风控：按 retry-after 或指数退避。</li>
+          <li>5xx / LS 异常：短冷却。</li>
+          <li>账号凭据失效：blocked 或 disabled，等待人工处理。</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="implementation">
+      <h2>落地进度</h2>
+      <div class="note">
+        <p><strong>更新时间：</strong>2026-05-21 14:35 CST。当前已经开始在本目录实现 Rust + React 新工程，不再修改 sub2api，也不在旧 WindsurfAPI 中继续二开。</p>
+      </div>
+      <div class="two" style="margin-top: 14px;">
+        <article class="card">
+          <h3>已落地</h3>
+          <ul>
+            <li>根目录 Rust workspace：<code>Cargo.toml</code>。</li>
+            <li>后端 crate：<code>crates/server</code>。</li>
+            <li>SQLite migration：<code>migrations/0001_init.sql</code>。</li>
+            <li>Axum API 骨架：setup、login、accounts、proxies、login_jobs、requests、settings、<code>/v1/models</code>、<code>/v1/messages</code>、<code>/v1/messages/count_tokens</code>。</li>
+            <li>React/Vite 管理台骨架：setup、login、dashboard、accounts、login-jobs、requests、proxies、settings。</li>
+            <li>批量登录已接真实邮箱密码流程：严格串行、随机等待、可选代理、事件流进度、JSON 凭据落库。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>当前边界</h3>
+          <ul>
+            <li><code>/v1/messages</code> 当前是占位响应，用于验证 Anthropic 兼容响应和请求记录。</li>
+            <li>批量登录支持 <code>email password</code> 与 <code>proxy email password</code> 输入；真实上游请求只在用户提交账号时发生。</li>
+            <li>账号凭据以 JSON 存入 SQLite，管理台只展示脱敏 key。</li>
+            <li>调度器、账号租约、LS 客户端和流式转发仍是下一阶段主线。</li>
+            <li>前端已可构建为静态产物，生产形态由 Rust 单端口托管。</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section id="claude">
+      <h2>Claude Code / Anthropic 首版要求</h2>
+      <div class="two">
+        <article class="card">
+          <h3>P0 能力</h3>
+          <ul>
+            <li>支持 <code>/v1/messages</code>。</li>
+            <li>支持 stream 与非 stream。</li>
+            <li>支持 Claude Code 常见请求体字段。</li>
+            <li>SSE 必须有明确结束。</li>
+            <li>错误响应尽量使用 Anthropic 风格。</li>
+            <li><code>count_tokens</code> 可以先估算，但接口不能缺。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>重点验证</h3>
+          <ul>
+            <li>Claude Code Opus 请求能正常结束。</li>
+            <li>工具调用相关内容不导致无限流。</li>
+            <li>sub2api 接入后不会出现长时间 token 下行不停。</li>
+            <li>上游 LS 异常时能返回明确错误，而不是悬挂连接。</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section id="deploy">
+      <h2>开发与部署形态</h2>
+      <div class="two">
+        <article class="card">
+          <h3>开发</h3>
+          <ul>
+            <li>Rust API 单独跑。</li>
+            <li>React Vite dev server 单独跑，固定端口 <code>9527</code>。</li>
+            <li>Vite proxy 到 Rust API。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>生产</h3>
+          <ul>
+            <li><code>pnpm --dir admin-ui build</code> 生成 React 构建产物。</li>
+            <li><code>cargo build --release</code> 生成 Rust 服务。</li>
+            <li>启动时传 <code>--static-dir admin-ui/dist</code> 后，同一个端口提供 API 和管理台。</li>
+            <li>静态托管使用 <code>tower-http</code> 的 <code>ServeDir</code> 与 <code>ServeFile</code>，SPA 路由刷新返回 <code>index.html</code>。</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section id="next">
+      <h2>下一步建议</h2>
+      <div class="card">
+        <h3>先出实施计划，再开始落代码</h3>
+        <p>实施计划应明确根目录 Rust 项目结构、React 项目结构、SQLite migration、P0 API contract、<code>/v1/messages</code> 请求生命周期、login job SSE 事件格式、request trace 落库格式和首批测试用例。</p>
+      </div>
+      <div class="steps" style="margin-top: 14px;">
+        <article class="card"><h3>Rust 骨架</h3><p>项目骨架、config、SQLite migration。</p></article>
+        <article class="card"><h3>React 骨架</h3><p>Vite 项目、路由、setup/login。</p></article>
+        <article class="card"><h3>管理鉴权</h3><p>管理 API 鉴权和 session。</p></article>
+        <article class="card"><h3>基础资源</h3><p>accounts/proxies 基础 CRUD。</p></article>
+        <article class="card"><h3>批量登录</h3><p>login_jobs 串行任务 + SSE。</p></article>
+        <article class="card"><h3>调度器</h3><p>scheduler 租约模型。</p></article>
+        <article class="card"><h3>模型列表</h3><p><code>/v1/models</code>。</p></article>
+        <article class="card"><h3>Claude Code 链路</h3><p><code>/v1/messages</code> 最小链路。</p></article>
+        <article class="card"><h3>证据链</h3><p>request trace 全链路记录。</p></article>
+      </div>
+    </section>
+
+    <footer>
+      相关调研报告：<code>docs/cpa-sub2api-rust-backend-research.html</code>。本 HTML 与 Markdown 交接文档内容保持一致，供新窗口快速恢复上下文。
+    </footer>
+  </main>
+</body>
+</html>
