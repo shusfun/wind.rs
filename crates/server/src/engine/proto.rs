@@ -1,279 +1,285 @@
-use anyhow::{anyhow, bail};
+use super::{EngineMessage, ParsedChatFrame};
+use anyhow::{Context, bail};
 use uuid::Uuid;
 
-#[derive(Debug)]
-pub struct TrajectoryStep {
-    pub kind: u64,
-    pub status: u64,
-    pub response_text: String,
-    pub modified_text: String,
-    pub error_text: String,
+const SYSTEM_FALLBACK: &str = "You are a helpful AI assistant. Respond clearly and concisely.";
+const WINDSURF_CLIENT_NAME: &str = "windsurf-next";
+const WINDSURF_IDE_VERSION: &str = "1.48.2";
+const WINDSURF_LANGUAGE_SERVER_VERSION: &str = "2.2.1017";
+
+pub struct ChatRequestParts<'a> {
+    pub api_key: &'a str,
+    pub jwt_token: &'a str,
+    pub model: &'a str,
+    pub messages: &'a [EngineMessage],
+    pub conversation_id: &'a str,
+    pub trajectory_run_id: &'a str,
+    pub session_id: &'a str,
+    pub step_number: u64,
 }
 
-pub fn build_initialize_panel_state_request(api_key: &str, session_id: &str) -> Vec<u8> {
-    [
-        write_message_field(1, &build_metadata(api_key, session_id)),
-        write_bool_field(3, true),
-    ]
-    .concat()
-}
-
-pub fn build_heartbeat_request(api_key: &str, session_id: &str) -> Vec<u8> {
-    write_message_field(1, &build_metadata(api_key, session_id))
-}
-
-pub fn build_add_tracked_workspace_request(workspace_path: &str) -> Vec<u8> {
-    write_string_field(1, workspace_path)
-}
-
-pub fn build_update_workspace_trust_request(
-    api_key: &str,
-    trusted: bool,
-    session_id: &str,
-) -> Vec<u8> {
-    [
-        write_message_field(1, &build_metadata(api_key, session_id)),
-        write_bool_field(2, trusted),
-    ]
-    .concat()
-}
-
-pub fn build_start_cascade_request(api_key: &str, session_id: &str) -> Vec<u8> {
-    [
-        write_message_field(1, &build_metadata(api_key, session_id)),
-        write_varint_field(4, 1),
-        write_varint_field(5, 1),
-    ]
-    .concat()
-}
-
-pub fn build_send_cascade_message_request(
-    api_key: &str,
-    cascade_id: &str,
-    text: &str,
-    model_enum: u64,
-    model_uid: Option<&str>,
-    session_id: &str,
-) -> anyhow::Result<Vec<u8>> {
-    Ok([
-        write_string_field(1, cascade_id),
-        write_message_field(2, &write_string_field(1, text)),
-        write_message_field(3, &build_metadata(api_key, session_id)),
-        write_message_field(5, &build_cascade_config(model_enum, model_uid)?),
-    ]
-    .concat())
-}
-
-pub fn build_get_cascade_trajectory_steps_request(cascade_id: &str, step_offset: u64) -> Vec<u8> {
-    let mut parts = vec![write_string_field(1, cascade_id)];
-    if step_offset > 0 {
-        parts.push(write_varint_field(2, step_offset));
-    }
-    parts.concat()
-}
-
-pub fn build_get_cascade_trajectory_request(cascade_id: &str) -> Vec<u8> {
-    write_string_field(1, cascade_id)
-}
-
-pub fn parse_start_cascade_response(buf: &[u8]) -> anyhow::Result<String> {
-    let fields = parse_fields(buf)?;
-    Ok(fields
-        .iter()
-        .find(|field| field.number == 1 && field.wire_type == 2)
-        .map(|field| String::from_utf8_lossy(&field.value).to_string())
-        .unwrap_or_default())
-}
-
-pub fn parse_trajectory_status(buf: &[u8]) -> anyhow::Result<u64> {
-    let fields = parse_fields(buf)?;
-    Ok(get_varint(&fields, 2).unwrap_or(0))
-}
-
-pub fn parse_trajectory_steps(buf: &[u8]) -> anyhow::Result<Vec<TrajectoryStep>> {
-    let fields = parse_fields(buf)?;
-    let mut steps = Vec::new();
-    for step in fields
-        .iter()
-        .filter(|field| field.number == 1 && field.wire_type == 2)
-    {
-        let step_fields = parse_fields(&step.value)?;
-        let kind = get_varint(&step_fields, 1).unwrap_or(0);
-        let status = get_varint(&step_fields, 4).unwrap_or(0);
-        let mut response_text = String::new();
-        let mut modified_text = String::new();
-        let mut error_text = String::new();
-        if let Some(planner) = get_len(&step_fields, 20) {
-            let planner_fields = parse_fields(planner)?;
-            if let Some(response) = get_len(&planner_fields, 1) {
-                response_text = String::from_utf8_lossy(response).to_string();
-            }
-            if let Some(modified) = get_len(&planner_fields, 8) {
-                modified_text = String::from_utf8_lossy(modified).to_string();
-            }
-        }
-        if let Some(error) = get_len(&step_fields, 24) {
-            if let Some(inner) = get_len(&parse_fields(error)?, 3) {
-                error_text = read_error_details(inner)?;
-            }
-        }
-        if error_text.is_empty() {
-            if let Some(error) = get_len(&step_fields, 31) {
-                error_text = read_error_details(error)?;
-            }
-        }
-        steps.push(TrajectoryStep {
-            kind,
-            status,
-            response_text,
-            modified_text,
-            error_text,
-        });
-    }
-    Ok(steps)
-}
-
-pub fn grpc_frame(payload: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(payload.len() + 5);
-    frame.push(0);
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    frame.extend_from_slice(payload);
-    frame
-}
-
-pub fn extract_grpc_payload(buf: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut pos = 0;
-    while pos + 5 <= buf.len() {
-        if buf[pos] != 0 {
-            break;
-        }
-        let len =
-            u32::from_be_bytes([buf[pos + 1], buf[pos + 2], buf[pos + 3], buf[pos + 4]]) as usize;
-        if pos + 5 + len > buf.len() {
-            break;
-        }
-        out.extend_from_slice(&buf[pos + 5..pos + 5 + len]);
-        pos += 5 + len;
-    }
-    if out.is_empty() && !buf.is_empty() {
-        Ok(buf.to_vec())
-    } else if out.is_empty() {
-        Err(anyhow!("gRPC 返回为空"))
-    } else {
-        Ok(out)
-    }
-}
-
-fn build_metadata(api_key: &str, session_id: &str) -> Vec<u8> {
-    [
-        write_string_field(1, "windsurf"),
-        write_string_field(2, "2.0.67"),
-        write_string_field(3, api_key),
-        write_string_field(4, "en"),
-        write_string_field(5, os_name()),
-        write_string_field(7, "2.0.67"),
-        write_string_field(8, arch_name()),
-        write_varint_field(9, rand_request_id()),
-        write_string_field(10, session_id),
-        write_string_field(12, "windsurf"),
-    ]
-    .concat()
-}
-
-fn build_cascade_config(model_enum: u64, model_uid: Option<&str>) -> anyhow::Result<Vec<u8>> {
-    if model_enum == 0 && model_uid.is_none() {
-        bail!("模型缺少 Windsurf enum/modelUid");
-    }
-    let no_tool_section = [
-        write_varint_field(1, 1),
-        write_string_field(2, "No tools are available."),
-    ]
-    .concat();
-    let additional = [
-        write_varint_field(1, 1),
-        write_string_field(
-            2,
-            "Answer directly in the user's language. Do not claim file, shell, or IDE access.",
-        ),
-    ]
-    .concat();
-    let communication = [
-        write_varint_field(1, 1),
-        write_string_field(2, "Respond clearly and directly."),
-    ]
-    .concat();
-    let conversational = [
-        write_varint_field(4, 3),
-        write_message_field(10, &no_tool_section),
-        write_message_field(12, &additional),
-        write_message_field(13, &communication),
-    ]
-    .concat();
-    let mut planner_parts = vec![write_message_field(2, &conversational)];
-    if let Some(uid) = model_uid {
-        planner_parts.push(write_string_field(35, uid));
-        planner_parts.push(write_string_field(34, uid));
-    }
-    if model_enum > 0 {
-        planner_parts.push(write_message_field(15, &write_varint_field(1, model_enum)));
-        planner_parts.push(write_varint_field(1, model_enum));
-    }
-    planner_parts.push(write_varint_field(6, 32768));
-    let empty_section = [write_varint_field(1, 1), write_string_field(2, "")].concat();
-    planner_parts.push(write_message_field(11, &empty_section));
-    let planner = planner_parts.concat();
-    let memory = write_varint_field(1, 0);
-    let brain = [
-        write_varint_field(1, 1),
-        write_message_field(6, &write_message_field(6, &[])),
-    ]
-    .concat();
-    Ok([
-        write_message_field(1, &planner),
-        write_message_field(5, &memory),
-        write_message_field(7, &brain),
-    ]
-    .concat())
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Field {
     number: u64,
     wire_type: u8,
+    raw: Vec<u8>,
     value: Vec<u8>,
     varint: Option<u64>,
+}
+
+pub fn build_chat_message_request(
+    template: &[u8],
+    parts: ChatRequestParts<'_>,
+) -> anyhow::Result<Vec<u8>> {
+    if parts.conversation_id.trim().is_empty() {
+        bail!("conversationId 不能为空");
+    }
+    if parts.trajectory_run_id.trim().is_empty() {
+        bail!("trajectoryRunId 不能为空");
+    }
+    let top_fields = parse_fields(template)?;
+    let mut out = Vec::new();
+    let mut wrote_messages = false;
+    let mut wrote_model = false;
+    let mut wrote_conversation = false;
+    let mut wrote_trajectory = false;
+    let mut wrote_session = false;
+    let (system, conversation) = split_messages(parts.messages);
+    let last_user_idx = conversation
+        .iter()
+        .rposition(|message| message.role == "user" || message.role == "tool");
+
+    for field in top_fields {
+        match (field.number, field.wire_type) {
+            (1, 2) => out.extend(write_message_field(
+                1,
+                &patch_metadata(&field.value, parts.api_key, parts.jwt_token)?,
+            )),
+            (2, 2) => out.extend(write_string_field(2, &system)),
+            (3, 2) => {
+                if !wrote_messages {
+                    for (idx, message) in conversation.iter().enumerate() {
+                        out.extend(build_message_block(
+                            message,
+                            last_user_idx.is_some_and(|last| last == idx),
+                        ));
+                    }
+                    wrote_messages = true;
+                }
+            }
+            (15, 2) => {
+                out.extend(write_message_field(
+                    15,
+                    &[
+                        write_string_field(1, parts.session_id),
+                        write_varint_field(2, parts.step_number),
+                        write_varint_field(3, 4),
+                        write_varint_field(4, 14),
+                    ]
+                    .concat(),
+                ));
+                wrote_session = true;
+            }
+            (16, 2) => {
+                out.extend(write_string_field(16, parts.conversation_id));
+                wrote_conversation = true;
+            }
+            (21, 2) => {
+                out.extend(write_string_field(21, parts.model));
+                wrote_model = true;
+            }
+            (22, 2) => {
+                out.extend(write_string_field(22, parts.trajectory_run_id));
+                wrote_trajectory = true;
+            }
+            (26, 2) => {}
+            _ => out.extend(field.raw),
+        }
+    }
+
+    if !wrote_messages {
+        for (idx, message) in conversation.iter().enumerate() {
+            out.extend(build_message_block(
+                message,
+                last_user_idx.is_some_and(|last| last == idx),
+            ));
+        }
+    }
+    if !wrote_session {
+        out.extend(write_message_field(
+            15,
+            &[
+                write_string_field(1, parts.session_id),
+                write_varint_field(2, parts.step_number),
+                write_varint_field(3, 4),
+                write_varint_field(4, 14),
+            ]
+            .concat(),
+        ));
+    }
+    if !wrote_conversation {
+        out.extend(write_string_field(16, parts.conversation_id));
+    }
+    if !wrote_model {
+        out.extend(write_string_field(21, parts.model));
+    }
+    if !wrote_trajectory {
+        out.extend(write_string_field(22, parts.trajectory_run_id));
+    }
+    Ok(out)
+}
+
+pub fn build_user_jwt_request(api_key: &str) -> Vec<u8> {
+    write_message_field(
+        1,
+        &[
+            write_string_field(1, WINDSURF_CLIENT_NAME),
+            write_string_field(2, WINDSURF_IDE_VERSION),
+            write_string_field(3, api_key),
+            write_string_field(4, "zh-cn"),
+            write_string_field(5, &os_metadata_json()),
+            write_string_field(7, WINDSURF_LANGUAGE_SERVER_VERSION),
+            write_string_field(8, &cpu_metadata_json()),
+            write_string_field(12, WINDSURF_CLIENT_NAME),
+        ]
+        .concat(),
+    )
+}
+
+pub fn parse_chat_frame(payload: &[u8]) -> anyhow::Result<ParsedChatFrame> {
+    let fields = parse_fields(payload)?;
+    let mut out = ParsedChatFrame::default();
+    for field in fields {
+        match (field.number, field.wire_type) {
+            (3, 2) => out.text = String::from_utf8_lossy(&field.value).to_string(),
+            (5, 0) => out.stop_reason = field.varint.map(stop_reason_name),
+            (7, 2) => apply_usage_block(&mut out, &field.value)?,
+            (17, 2) => {
+                out.conversation_id = Some(String::from_utf8_lossy(&field.value).to_string())
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+fn split_messages(messages: &[EngineMessage]) -> (String, Vec<EngineMessage>) {
+    let mut system = String::new();
+    let mut conversation = Vec::new();
+    for message in messages {
+        if message.role == "system" && system.is_empty() && !message.content.trim().is_empty() {
+            system = message.content.clone();
+        } else {
+            conversation.push(message.clone());
+        }
+    }
+    if system.is_empty() {
+        system = SYSTEM_FALLBACK.to_string();
+    }
+    if conversation.is_empty() {
+        conversation.push(EngineMessage {
+            role: "user".to_string(),
+            content: "Hello".to_string(),
+        });
+    }
+    (system, conversation)
+}
+
+fn patch_metadata(metadata: &[u8], api_key: &str, jwt_token: &str) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut wrote_api_key = false;
+    let mut wrote_jwt = false;
+    for field in parse_fields(metadata)? {
+        match (field.number, field.wire_type) {
+            (3, 2) => {
+                out.extend(write_string_field(3, api_key));
+                wrote_api_key = true;
+            }
+            (16 | 24 | 27 | 31, _) => {}
+            (21, 2) => {
+                out.extend(write_string_field(21, jwt_token));
+                wrote_jwt = true;
+            }
+            _ => out.extend(field.raw),
+        }
+    }
+    if !wrote_api_key {
+        out.extend(write_string_field(3, api_key));
+    }
+    if !wrote_jwt {
+        out.extend(write_string_field(21, jwt_token));
+    }
+    let now = chrono::Utc::now();
+    out.extend(write_message_field(
+        16,
+        &[
+            write_varint_field(1, now.timestamp().max(0) as u64),
+            write_varint_field(2, now.timestamp_subsec_nanos() as u64),
+        ]
+        .concat(),
+    ));
+    Ok(out)
+}
+
+fn build_message_block(message: &EngineMessage, current_turn: bool) -> Vec<u8> {
+    let role = match message.role.as_str() {
+        "assistant" => 2,
+        "tool" => 4,
+        _ => 1,
+    };
+    let mut inner = Vec::new();
+    if role == 2 {
+        inner.extend(write_string_field(1, &format!("bot-{}", Uuid::new_v4())));
+    }
+    inner.extend(write_varint_field(2, role));
+    inner.extend(write_string_field(3, &message.content));
+    inner.extend(write_varint_field(4, estimate_tokens(&message.content)));
+    if role == 1 {
+        inner.extend(write_varint_field(5, 1));
+    }
+    if current_turn && (role == 1 || role == 4) {
+        inner.extend(write_bytes_field(8, &[8, 1]));
+    }
+    write_message_field(3, &inner)
+}
+
+fn apply_usage_block(out: &mut ParsedChatFrame, payload: &[u8]) -> anyhow::Result<()> {
+    for field in parse_fields(payload)? {
+        match (field.number, field.wire_type) {
+            (3, 0) => out.completion_tokens = field.varint,
+            (4, 0) => out.prompt_tokens = field.varint,
+            (5, 0) => {}
+            (6, 0) if out.stop_reason.is_none() => {
+                out.stop_reason = field.varint.map(stop_reason_name)
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn parse_fields(buf: &[u8]) -> anyhow::Result<Vec<Field>> {
     let mut fields = Vec::new();
     let mut pos = 0;
     while pos < buf.len() {
-        let (tag, used) = decode_varint(&buf[pos..])?;
+        let start = pos;
+        let (tag, used) = decode_varint(&buf[pos..]).context("protobuf tag 解析失败")?;
         pos += used;
         let number = tag >> 3;
         let wire_type = (tag & 0x07) as u8;
+        let mut value = Vec::new();
+        let mut varint = None;
         match wire_type {
             0 => {
-                let (value, used) = decode_varint(&buf[pos..])?;
+                let (parsed, used) = decode_varint(&buf[pos..])?;
                 pos += used;
-                fields.push(Field {
-                    number,
-                    wire_type,
-                    value: Vec::new(),
-                    varint: Some(value),
-                });
+                varint = Some(parsed);
             }
             1 => {
                 if pos + 8 > buf.len() {
-                    bail!("fixed64 截断");
+                    bail!("fixed64 字段截断");
                 }
-                fields.push(Field {
-                    number,
-                    wire_type,
-                    value: buf[pos..pos + 8].to_vec(),
-                    varint: None,
-                });
+                value.extend_from_slice(&buf[pos..pos + 8]);
                 pos += 8;
             }
             2 => {
@@ -283,96 +289,48 @@ fn parse_fields(buf: &[u8]) -> anyhow::Result<Vec<Field>> {
                 if pos + len > buf.len() {
                     bail!("length-delimited 字段截断");
                 }
-                fields.push(Field {
-                    number,
-                    wire_type,
-                    value: buf[pos..pos + len].to_vec(),
-                    varint: None,
-                });
+                value.extend_from_slice(&buf[pos..pos + len]);
                 pos += len;
             }
             5 => {
                 if pos + 4 > buf.len() {
-                    bail!("fixed32 截断");
+                    bail!("fixed32 字段截断");
                 }
-                fields.push(Field {
-                    number,
-                    wire_type,
-                    value: buf[pos..pos + 4].to_vec(),
-                    varint: None,
-                });
+                value.extend_from_slice(&buf[pos..pos + 4]);
                 pos += 4;
             }
             other => bail!("未知 protobuf wire type {}", other),
         }
+        fields.push(Field {
+            number,
+            wire_type,
+            raw: buf[start..pos].to_vec(),
+            value,
+            varint,
+        });
     }
     Ok(fields)
-}
-
-fn get_varint(fields: &[Field], number: u64) -> Option<u64> {
-    fields
-        .iter()
-        .find(|field| field.number == number && field.wire_type == 0)
-        .and_then(|field| field.varint)
-}
-
-fn get_len(fields: &[Field], number: u64) -> Option<&[u8]> {
-    fields
-        .iter()
-        .find(|field| field.number == number && field.wire_type == 2)
-        .map(|field| field.value.as_slice())
-}
-
-fn read_error_details(buf: &[u8]) -> anyhow::Result<String> {
-    let fields = parse_fields(buf)?;
-    for number in [1_u64, 2, 3] {
-        if let Some(value) = get_len(&fields, number) {
-            let msg = String::from_utf8_lossy(value)
-                .trim()
-                .lines()
-                .next()
-                .unwrap_or("")
-                .to_string();
-            if !msg.is_empty() {
-                return Ok(msg.chars().take(300).collect());
-            }
-        }
-    }
-    Ok(String::new())
 }
 
 fn write_varint_field(field: u64, value: u64) -> Vec<u8> {
     [encode_varint((field << 3) | 0), encode_varint(value)].concat()
 }
 
-fn write_bool_field(field: u64, value: bool) -> Vec<u8> {
-    if value {
-        write_varint_field(field, 1)
-    } else {
-        Vec::new()
-    }
-}
-
 fn write_string_field(field: u64, value: &str) -> Vec<u8> {
-    let bytes = value.as_bytes();
-    [
-        encode_varint((field << 3) | 2),
-        encode_varint(bytes.len() as u64),
-        bytes.to_vec(),
-    ]
-    .concat()
+    write_bytes_field(field, value.as_bytes())
 }
 
-fn write_message_field(field: u64, value: &[u8]) -> Vec<u8> {
-    if value.is_empty() {
-        return Vec::new();
-    }
+fn write_bytes_field(field: u64, value: &[u8]) -> Vec<u8> {
     [
         encode_varint((field << 3) | 2),
         encode_varint(value.len() as u64),
         value.to_vec(),
     ]
     .concat()
+}
+
+fn write_message_field(field: u64, value: &[u8]) -> Vec<u8> {
+    write_bytes_field(field, value)
 }
 
 fn encode_varint(mut value: u64) -> Vec<u8> {
@@ -407,26 +365,53 @@ fn decode_varint(buf: &[u8]) -> anyhow::Result<(u64, usize)> {
     bail!("varint 截断")
 }
 
-fn os_name() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "windows") {
-        "windows"
-    } else {
-        "linux"
-    }
+fn estimate_tokens(text: &str) -> u64 {
+    ((text.chars().count() as f64 / 3.5).ceil() as u64).max(1)
 }
 
-fn arch_name() -> &'static str {
-    if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "x86_64"
+fn stop_reason_name(value: u64) -> String {
+    match value {
+        4 => "tool_use",
+        _ => "end_turn",
     }
+    .to_string()
 }
 
-fn rand_request_id() -> u64 {
-    let id = Uuid::new_v4();
-    let bytes = id.as_bytes();
-    u64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8])) & 0x0000_FFFF_FFFF_FFFF
+fn os_metadata_json() -> String {
+    let (os_name, arch) = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => ("darwin", "arm64"),
+        ("macos", _) => ("darwin", "x64"),
+        ("windows", "x86_64") => ("windows", "x64"),
+        ("windows", _) => ("windows", std::env::consts::ARCH),
+        ("linux", "x86_64") => ("linux", "x64"),
+        ("linux", "aarch64") => ("linux", "arm64"),
+        (os, arch) => (os, arch),
+    };
+    serde_json::json!({
+        "Os": os_name,
+        "Arch": arch,
+        "Version": "15.0",
+        "ProductName": std::env::consts::OS,
+        "MajorVersionNumber": 15,
+        "MinorVersionNumber": 0,
+        "Build": "0"
+    })
+    .to_string()
+}
+
+fn cpu_metadata_json() -> String {
+    let threads = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    serde_json::json!({
+        "NumSockets": 1,
+        "NumCores": (threads / 2).max(1),
+        "NumThreads": threads,
+        "VendorID": "",
+        "Family": "",
+        "Model": "",
+        "ModelName": std::env::consts::ARCH,
+        "Memory": 0
+    })
+    .to_string()
 }

@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   last_used_at TEXT,
   last_probed_at TEXT,
   rate_limited_until TEXT,
+  rate_limit_probe_after TEXT,
   rpm_used INTEGER NOT NULL DEFAULT 0,
   rpm_limit INTEGER NOT NULL DEFAULT 60,
   credits_json TEXT,
@@ -117,6 +118,7 @@ CREATE TABLE IF NOT EXISTS account_model_rate_limits (
   model TEXT NOT NULL,
   limited_until TEXT NOT NULL,
   reason TEXT,
+  probe_after TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (account_id, model)
 );

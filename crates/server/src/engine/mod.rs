@@ -1,62 +1,59 @@
 mod proto;
 
 use anyhow::{Context, anyhow};
-use async_stream::stream;
-use bytes::Bytes;
+use async_stream::try_stream;
+use bytes::{Buf, BytesMut};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use futures_core::Stream;
+use futures_util::StreamExt;
+use reqwest::{Client, Proxy};
+use sha2::Digest;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    io::{Read, Write},
     path::PathBuf,
-    process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{
-    net::TcpStream,
-    process::{Child, Command},
-    sync::Mutex,
-};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
-const DEFAULT_CSRF: &str = "windsurf-api-csrf-fixed-token";
 const DEFAULT_API_URL: &str = "https://server.self-serve.windsurf.com";
-const LS_SERVICE: &str = "/exa.language_server_pb.LanguageServerService";
+const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+const CHAT_PATH: &str = "/exa.api_server_pb.ApiServerService/GetChatMessage";
+const USER_JWT_PATH: &str = "/exa.auth_pb.AuthService/GetUserJwt";
+const FRAME_DATA: u8 = 0;
+const FRAME_GZIP_DATA: u8 = 1;
+const FRAME_TRAILER: u8 = 2;
+const FRAME_GZIP_TRAILER: u8 = 3;
+const JWT_REFRESH_LEEWAY_SECS: i64 = 120;
+
+const BUILTIN_GET_CHAT_MESSAGE: &[u8] =
+    include_bytes!("../../resources/templates/GetChatMessage_req.bin");
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
-    pub binary_path: Option<PathBuf>,
-    pub data_dir: PathBuf,
-    pub max_instances: usize,
-    pub cascade_poll_interval_ms: u64,
-    pub cascade_max_wait_ms: u64,
-    pub cascade_warm_stall_ms: u64,
+    pub api_base_url: String,
+    pub template_dir: Option<PathBuf>,
+    pub request_timeout_ms: u64,
 }
 
 impl EngineConfig {
     pub fn from_settings(settings: &HashMap<String, String>, data_dir: PathBuf) -> Self {
-        let binary_path = settings
-            .get("lsBinaryPath")
-            .and_then(|value| {
-                serde_json::from_str::<String>(value)
-                    .ok()
-                    .or(Some(value.clone()))
-            })
+        let template_dir = setting_string(settings, "remoteTemplateDir")
             .map(PathBuf::from)
             .filter(|path| !path.as_os_str().is_empty());
+        let api_base_url = setting_string(settings, "remoteApiBaseUrl")
+            .unwrap_or_else(|| DEFAULT_API_URL.to_string())
+            .trim_end_matches('/')
+            .to_string();
         Self {
-            binary_path,
-            data_dir: settings
-                .get("lsDataDir")
-                .and_then(|value| {
-                    serde_json::from_str::<String>(value)
-                        .ok()
-                        .or(Some(value.clone()))
-                })
-                .map(PathBuf::from)
-                .unwrap_or_else(|| data_dir.join("ls")),
-            max_instances: setting_usize(settings, "lsMaxInstances", 20),
-            cascade_poll_interval_ms: setting_u64(settings, "cascadePollIntervalMs", 500),
-            cascade_max_wait_ms: setting_u64(settings, "cascadeMaxWaitMs", 600_000),
-            cascade_warm_stall_ms: setting_u64(settings, "cascadeWarmStallMs", 45_000),
+            api_base_url,
+            template_dir: template_dir.or_else(|| {
+                let path = data_dir.join("remote-templates");
+                path.exists().then_some(path)
+            }),
+            request_timeout_ms: setting_u64(settings, "remoteRequestTimeoutMs", DEFAULT_TIMEOUT_MS),
         }
     }
 }
@@ -64,6 +61,7 @@ impl EngineConfig {
 #[derive(Clone, Debug)]
 pub struct EngineAccount {
     pub api_key: String,
+    pub jwt_token: Option<String>,
     pub proxy_url: Option<String>,
 }
 
@@ -76,483 +74,684 @@ pub struct EngineMessage {
 #[derive(Clone, Debug)]
 pub struct EngineModel {
     pub id: String,
-    pub enum_value: u64,
     pub model_uid: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct EngineChunk {
     pub text: String,
+    #[allow(dead_code)]
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    #[allow(dead_code)]
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Clone)]
-pub struct WindsurfEngine {
+pub struct RemoteApiEngine {
     inner: Arc<EngineInner>,
 }
 
 struct EngineInner {
     config: EngineConfig,
-    pool: Mutex<HashMap<String, Arc<Mutex<LsEntry>>>>,
-    next_port: Mutex<u16>,
+    sessions: Arc<Mutex<SessionStore>>,
+    jwt_cache: Arc<Mutex<HashMap<String, CachedJwt>>>,
 }
 
-struct LsEntry {
-    key: String,
-    port: u16,
-    csrf: String,
-    proxy_url: Option<String>,
-    child: Child,
-    ready: bool,
-    session_id: Option<String>,
-    workspace_ready: bool,
-    started_at: Instant,
+#[derive(Clone, Debug)]
+struct CachedJwt {
+    token: String,
+    exp_sec: Option<i64>,
+    cached_at: Instant,
 }
 
-impl WindsurfEngine {
+#[derive(Clone, Debug)]
+struct SessionState {
+    conversation_id: String,
+    trajectory_run_id: String,
+    session_id: String,
+    step_number: u64,
+    updated_at: Instant,
+}
+
+#[derive(Default)]
+struct SessionStore {
+    entries: HashMap<String, SessionState>,
+    order: VecDeque<String>,
+}
+
+struct ChatFrame {
+    payload: Vec<u8>,
+    is_trailer: bool,
+}
+
+#[derive(Default)]
+struct FrameReader {
+    buf: BytesMut,
+}
+
+#[derive(Default)]
+struct ParsedChatFrame {
+    text: String,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    stop_reason: Option<String>,
+    conversation_id: Option<String>,
+}
+
+impl RemoteApiEngine {
     pub fn new(config: EngineConfig) -> Self {
         Self {
             inner: Arc::new(EngineInner {
                 config,
-                pool: Mutex::new(HashMap::new()),
-                next_port: Mutex::new(42100),
+                sessions: Arc::new(Mutex::new(SessionStore::default())),
+                jwt_cache: Arc::new(Mutex::new(HashMap::new())),
             }),
         }
     }
 
-    pub async fn cascade_stream(
+    pub async fn messages_stream(
         &self,
+        trace_id: Option<String>,
+        caller_session_key: Option<String>,
         account: EngineAccount,
         model: EngineModel,
         messages: Vec<EngineMessage>,
-    ) -> anyhow::Result<impl futures_core::Stream<Item = anyhow::Result<EngineChunk>>> {
-        let account_key = account_key(&account.api_key);
-        let entry = self
-            .ensure_ls(account.proxy_url.clone(), account_key)
-            .await?;
+    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<EngineChunk>>> {
         let config = self.inner.config.clone();
-        Ok(stream! {
-            let result = cascade_chat(entry, config, account.api_key, model, messages).await;
-            match result {
-                Ok(chunks) => {
-                    for text in chunks {
-                        yield Ok(EngineChunk { text });
+        let trace_id = trace_id.unwrap_or_else(|| "none".to_string());
+        let session_key = session_key(
+            &account.api_key,
+            &model,
+            caller_session_key.as_deref(),
+            &messages,
+        );
+        let session = {
+            let mut sessions = self.inner.sessions.lock().await;
+            sessions.acquire(&session_key)
+        };
+        tracing::debug!(
+            trace_id = %trace_id,
+            model = %model.id,
+            model_uid = model.model_uid.as_deref().unwrap_or("none"),
+            message_count = messages.len(),
+            proxy_configured = account.proxy_url.is_some(),
+            step_number = session.step_number + 1,
+            "windsurf upstream request prepare"
+        );
+        tracing::debug!(
+            trace_id = %trace_id,
+            conversation_hash = %short_hash(&session.conversation_id),
+            trajectory_hash = %short_hash(&session.trajectory_run_id),
+            session_hash = %short_hash(&session.session_id),
+            "windsurf upstream session"
+        );
+        let client = build_client(account.proxy_url.as_deref(), config.request_timeout_ms)?;
+        let jwt_token = self.resolve_jwt(&client, &account).await?;
+        let template = load_template(&config, "GetChatMessage_req.bin")?;
+        let payload = proto::build_chat_message_request(
+            &template,
+            proto::ChatRequestParts {
+                api_key: &account.api_key,
+                jwt_token: &jwt_token,
+                model: model.model_uid.as_deref().unwrap_or(&model.id),
+                messages: &messages,
+                conversation_id: &session.conversation_id,
+                trajectory_run_id: &session.trajectory_run_id,
+                session_id: &session.session_id,
+                step_number: session.step_number + 1,
+            },
+        )?;
+        let url = format!("{}{}", config.api_base_url.trim_end_matches('/'), CHAT_PATH);
+        let sessions = self.inner.sessions.clone();
+        Ok(try_stream! {
+            let upstream_started_at = Instant::now();
+            tracing::debug!(
+                trace_id = %trace_id,
+                path = CHAT_PATH,
+                payload_bytes = payload.len(),
+                request_timeout_ms = config.request_timeout_ms,
+                "windsurf upstream request send"
+            );
+            let response = client
+                .post(&url)
+                .header("user-agent", "connect-go/1.18.1 (go1.26.0)")
+                .header("content-type", "application/connect+proto")
+                .header("connect-protocol-version", "1")
+                .header("connect-accept-encoding", "gzip")
+                .header("connect-content-encoding", "gzip")
+                .header("connect-timeout-ms", config.request_timeout_ms.to_string())
+                .header("accept-encoding", "identity")
+                .body(build_frame(&payload, true)?)
+                .send()
+                .await
+                .map_err(|err| {
+                    tracing::error!(
+                        trace_id = %trace_id,
+                        error = %redact_log_text(&err.to_string()),
+                        elapsed_ms = upstream_started_at.elapsed().as_millis() as u64,
+                        "windsurf upstream send failed"
+                    );
+                    err
+                })
+                .context("请求 Windsurf 远端接口失败")?;
+            let status = response.status();
+            tracing::info!(
+                trace_id = %trace_id,
+                status = status.as_u16(),
+                elapsed_ms = upstream_started_at.elapsed().as_millis() as u64,
+                "windsurf upstream response"
+            );
+            let response = if status.is_success() {
+                response
+            } else {
+                let status_code = status.as_u16();
+                let body = response.text().await.unwrap_or_default();
+                tracing::error!(
+                    trace_id = %trace_id,
+                    status = status_code,
+                    body = %redact_log_text(&body),
+                    elapsed_ms = upstream_started_at.elapsed().as_millis() as u64,
+                    "windsurf upstream non-success"
+                );
+                Err::<reqwest::Response, anyhow::Error>(anyhow!(
+                    "Windsurf 远端返回 HTTP {}: {}",
+                    status_code,
+                    redact_log_text(&body)
+                ))?;
+                unreachable!();
+            };
+            let mut frames = FrameReader::default();
+            let mut saw_text = false;
+            let mut latest_prompt_tokens = None;
+            let mut latest_completion_tokens = None;
+            let mut latest_stop_reason = None;
+            let mut stream = response.bytes_stream();
+            let mut byte_count = 0_u64;
+            let mut frame_count = 0_u64;
+            let mut text_chunk_count = 0_u64;
+            let mut first_text_logged = false;
+            while let Some(item) = stream.next().await {
+                let chunk = item.map_err(|err| {
+                    tracing::error!(
+                        trace_id = %trace_id,
+                        error = %redact_log_text(&err.to_string()),
+                        elapsed_ms = upstream_started_at.elapsed().as_millis() as u64,
+                        "windsurf upstream stream read failed"
+                    );
+                    err
+                }).context("读取 Windsurf 远端流失败")?;
+                byte_count += chunk.len() as u64;
+                frames.push(&chunk);
+                for frame in frames.drain()? {
+                    frame_count += 1;
+                    if frame.is_trailer {
+                        let trailer = String::from_utf8_lossy(&frame.payload);
+                        if trailer.contains("\"error\"") {
+                            tracing::error!(
+                                trace_id = %trace_id,
+                                trailer = %redact_log_text(&trailer),
+                                elapsed_ms = upstream_started_at.elapsed().as_millis() as u64,
+                                "windsurf upstream trailer error"
+                            );
+                            Err::<(), anyhow::Error>(anyhow!(
+                                "Windsurf 远端 trailer 错误: {}",
+                                redact_log_text(&trailer)
+                            ))?;
+                        }
+                        continue;
+                    }
+                    let parsed = proto::parse_chat_frame(&frame.payload).map_err(|err| {
+                        tracing::error!(
+                            trace_id = %trace_id,
+                            error = %redact_log_text(&err.to_string()),
+                            frame_count,
+                            elapsed_ms = upstream_started_at.elapsed().as_millis() as u64,
+                            "windsurf upstream frame parse failed"
+                        );
+                        err
+                    })?;
+                    if let Some(conversation_id) = parsed.conversation_id.as_deref().filter(|value| !value.is_empty()) {
+                        let mut store = sessions.lock().await;
+                        store.update_conversation(&session_key, conversation_id);
+                    }
+                    if parsed.prompt_tokens.is_some() {
+                        latest_prompt_tokens = parsed.prompt_tokens;
+                    }
+                    if parsed.completion_tokens.is_some() {
+                        latest_completion_tokens = parsed.completion_tokens;
+                    }
+                    if parsed.stop_reason.is_some() {
+                        latest_stop_reason = parsed.stop_reason.clone();
+                    }
+                    if !parsed.text.is_empty() {
+                        saw_text = true;
+                        text_chunk_count += 1;
+                        if !first_text_logged {
+                            first_text_logged = true;
+                            tracing::debug!(
+                                trace_id = %trace_id,
+                                first_text_ms = upstream_started_at.elapsed().as_millis() as u64,
+                                "windsurf upstream first text"
+                            );
+                        }
+                        tracing::debug!(
+                            trace_id = %trace_id,
+                            frame_count,
+                            text_chunk_count,
+                            text_chars = parsed.text.chars().count(),
+                            prompt_tokens = latest_prompt_tokens.unwrap_or(0),
+                            completion_tokens = latest_completion_tokens.unwrap_or(0),
+                            "windsurf upstream text chunk"
+                        );
+                        yield EngineChunk {
+                            text: parsed.text,
+                            prompt_tokens: latest_prompt_tokens,
+                            completion_tokens: latest_completion_tokens,
+                            stop_reason: None,
+                        };
                     }
                 }
-                Err(err) => yield Err(err),
+            }
+            {
+                let mut store = sessions.lock().await;
+                store.commit(&session_key);
+            }
+            tracing::info!(
+                trace_id = %trace_id,
+                elapsed_ms = upstream_started_at.elapsed().as_millis() as u64,
+                byte_count,
+                frame_count,
+                text_chunk_count,
+                prompt_tokens = latest_prompt_tokens.unwrap_or(0),
+                completion_tokens = latest_completion_tokens.unwrap_or(0),
+                stop_reason = latest_stop_reason.as_deref().unwrap_or("none"),
+                "windsurf upstream stream complete"
+            );
+            if !saw_text {
+                yield EngineChunk {
+                    text: String::new(),
+                    prompt_tokens: latest_prompt_tokens,
+                    completion_tokens: latest_completion_tokens,
+                    stop_reason: latest_stop_reason.or_else(|| Some("end_turn".to_string())),
+                };
             }
         })
     }
 
-    async fn ensure_ls(
+    async fn resolve_jwt(
         &self,
-        proxy_url: Option<String>,
-        account_key: String,
-    ) -> anyhow::Result<Arc<Mutex<LsEntry>>> {
-        let key = ls_key(proxy_url.as_deref(), &account_key);
-        if let Some(entry) = self.inner.pool.lock().await.get(&key).cloned() {
-            if entry.lock().await.ready {
-                return Ok(entry);
+        client: &Client,
+        account: &EngineAccount,
+    ) -> anyhow::Result<String> {
+        if let Some(jwt) = account
+            .jwt_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| is_jwt_like(value))
+        {
+            return Ok(jwt.to_string());
+        }
+        let cache_key = account.api_key.clone();
+        {
+            let cache = self.inner.jwt_cache.lock().await;
+            if let Some(cached) = cache.get(&cache_key).filter(|item| item.is_valid()) {
+                return Ok(cached.token.clone());
             }
         }
-        let binary = self
-            .inner
-            .config
-            .binary_path
-            .clone()
-            .ok_or_else(|| anyhow!("请先配置 LS 二进制路径"))?;
-        if !binary.exists() {
-            return Err(anyhow!("LS 二进制不存在：{}", binary.display()));
-        }
-        let mut pool = self.inner.pool.lock().await;
-        if pool.len() >= self.inner.config.max_instances {
-            evict_one(&mut pool).await;
-        }
-        let port = {
-            let mut next = self.inner.next_port.lock().await;
-            let port = *next;
-            *next = next.saturating_add(1);
-            port
+        let token = fetch_user_jwt(client, &self.inner.config, &account.api_key).await?;
+        let cached = CachedJwt {
+            exp_sec: jwt_exp_sec(&token),
+            token: token.clone(),
+            cached_at: Instant::now(),
         };
-        let data_dir = self.inner.config.data_dir.join(&key);
-        tokio::fs::create_dir_all(data_dir.join("db")).await?;
-        let mut cmd = Command::new(binary);
-        cmd.arg(format!("--api_server_url={DEFAULT_API_URL}"))
-            .arg(format!("--server_port={port}"))
-            .arg(format!("--csrf_token={DEFAULT_CSRF}"))
-            .arg("--register_user_url=https://api.codeium.com/register_user/")
-            .arg(format!("--codeium_dir={}", data_dir.display()))
-            .arg(format!("--database_dir={}", data_dir.join("db").display()))
-            .arg("--detect_proxy=false")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if let Some(proxy) = proxy_url.as_deref() {
-            cmd.env("HTTP_PROXY", proxy)
-                .env("HTTPS_PROXY", proxy)
-                .env("http_proxy", proxy)
-                .env("https_proxy", proxy);
-        }
-        let child = cmd.spawn().context("启动 LS 失败")?;
-        wait_port(port, Duration::from_secs(25)).await?;
-        let entry = Arc::new(Mutex::new(LsEntry {
-            key: key.clone(),
-            port,
-            csrf: DEFAULT_CSRF.to_string(),
-            proxy_url,
-            child,
-            ready: true,
-            session_id: None,
-            workspace_ready: false,
-            started_at: Instant::now(),
-        }));
-        pool.insert(key, entry.clone());
-        Ok(entry)
+        let mut cache = self.inner.jwt_cache.lock().await;
+        cache.insert(cache_key, cached);
+        Ok(token)
     }
 }
 
-async fn cascade_chat(
-    entry: Arc<Mutex<LsEntry>>,
-    config: EngineConfig,
-    api_key: String,
-    model: EngineModel,
-    messages: Vec<EngineMessage>,
-) -> anyhow::Result<Vec<String>> {
-    let (port, csrf, session_id) = {
-        let mut entry = entry.lock().await;
-        let session = entry
-            .session_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        entry.session_id = Some(session.clone());
-        (entry.port, entry.csrf.clone(), session)
-    };
-    tracing::debug!(model = %model.id, port, "开始 Cascade 请求");
-    warmup_cascade(entry.clone(), &config, &api_key, &session_id).await?;
-    let start = proto::build_start_cascade_request(&api_key, &session_id);
-    let start_resp = grpc_unary(
-        port,
-        &csrf,
-        &format!("{LS_SERVICE}/StartCascade"),
-        start,
-        Duration::from_secs(30),
-    )
-    .await?;
-    let cascade_id = proto::parse_start_cascade_response(&start_resp)?;
-    if cascade_id.is_empty() {
-        return Err(anyhow!("StartCascade 没有返回会话 ID"));
+impl CachedJwt {
+    fn is_valid(&self) -> bool {
+        if !is_jwt_like(&self.token) {
+            return false;
+        }
+        if let Some(exp_sec) = self.exp_sec {
+            return chrono::Utc::now().timestamp() < exp_sec - JWT_REFRESH_LEEWAY_SECS;
+        }
+        self.cached_at.elapsed() < Duration::from_secs(10 * 60)
     }
-    let prompt = build_prompt(&messages);
-    let send = proto::build_send_cascade_message_request(
-        &api_key,
-        &cascade_id,
-        &prompt,
-        model.enum_value,
-        model.model_uid.as_deref(),
-        &session_id,
-    )?;
-    grpc_unary(
-        port,
-        &csrf,
-        &format!("{LS_SERVICE}/SendUserCascadeMessage"),
-        send,
-        Duration::from_secs(30),
-    )
-    .await?;
-    let deadline = Instant::now() + Duration::from_millis(config.cascade_max_wait_ms);
-    let mut chunks = Vec::new();
-    let mut yielded_by_step = HashMap::<usize, usize>::new();
-    let mut last_growth = Instant::now();
-    let mut idle_count = 0_u32;
-    let mut saw_active = false;
-    let mut saw_text = false;
-    while Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(config.cascade_poll_interval_ms)).await;
-        let req = proto::build_get_cascade_trajectory_steps_request(&cascade_id, 0);
-        let resp = grpc_unary(
-            port,
-            &csrf,
-            &format!("{LS_SERVICE}/GetCascadeTrajectorySteps"),
-            req,
-            Duration::from_secs(30),
-        )
-        .await?;
-        let steps = proto::parse_trajectory_steps(&resp)?;
-        for (idx, step) in steps.iter().enumerate() {
-            if step.kind == 17 && !step.error_text.is_empty() {
-                return Err(anyhow!("Cascade 返回错误：{}", step.error_text));
-            }
-            if step.status != 1 {
-                saw_active = true;
-            }
-            let live_text = if step.response_text.is_empty() {
-                step.modified_text.as_str()
+}
+
+impl SessionStore {
+    fn acquire(&mut self, key: &str) -> SessionState {
+        let now = Instant::now();
+        self.sweep(now);
+        if let Some(state) = self.entries.get_mut(key) {
+            state.updated_at = now;
+            return state.clone();
+        }
+        let state = SessionState {
+            conversation_id: Uuid::new_v4().to_string(),
+            trajectory_run_id: Uuid::new_v4().to_string(),
+            session_id: Uuid::new_v4().to_string(),
+            step_number: 0,
+            updated_at: now,
+        };
+        self.entries.insert(key.to_string(), state.clone());
+        self.order.push_back(key.to_string());
+        while self.entries.len() > 512 {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
             } else {
-                step.response_text.as_str()
-            };
-            let prev = *yielded_by_step.get(&idx).unwrap_or(&0);
-            if live_text.len() > prev {
-                let delta = live_text[prev..].to_string();
-                yielded_by_step.insert(idx, live_text.len());
-                last_growth = Instant::now();
-                saw_text = true;
-                chunks.push(delta);
+                break;
             }
         }
-        if saw_text && last_growth.elapsed() > Duration::from_millis(config.cascade_warm_stall_ms) {
-            return final_sweep(port, &csrf, &cascade_id, &mut yielded_by_step, &mut chunks).await;
-        }
-        let status_req = proto::build_get_cascade_trajectory_request(&cascade_id);
-        let status_resp = grpc_unary(
-            port,
-            &csrf,
-            &format!("{LS_SERVICE}/GetCascadeTrajectory"),
-            status_req,
-            Duration::from_secs(30),
-        )
-        .await?;
-        let status = proto::parse_trajectory_status(&status_resp)?;
-        if status != 1 {
-            saw_active = true;
-            idle_count = 0;
-            continue;
-        }
-        if !saw_active {
-            continue;
-        }
-        idle_count += 1;
-        let growth_settled = last_growth.elapsed()
-            > Duration::from_millis(config.cascade_poll_interval_ms.saturating_mul(2));
-        if (saw_text && idle_count >= 2 && growth_settled) || (!saw_text && idle_count >= 4) {
-            return final_sweep(port, &csrf, &cascade_id, &mut yielded_by_step, &mut chunks).await;
+        state
+    }
+
+    fn update_conversation(&mut self, key: &str, conversation_id: &str) {
+        if let Some(state) = self.entries.get_mut(key) {
+            state.conversation_id = conversation_id.to_string();
+            state.updated_at = Instant::now();
         }
     }
-    if chunks.is_empty() {
-        Err(anyhow!("Cascade 等待超时"))
-    } else {
-        Ok(chunks)
+
+    fn commit(&mut self, key: &str) {
+        if let Some(state) = self.entries.get_mut(key) {
+            state.step_number += 1;
+            state.updated_at = Instant::now();
+        }
+    }
+
+    fn sweep(&mut self, now: Instant) {
+        let max_idle = Duration::from_secs(30 * 60);
+        self.entries
+            .retain(|_, state| now.duration_since(state.updated_at) <= max_idle);
+        self.order.retain(|key| self.entries.contains_key(key));
     }
 }
 
-async fn warmup_cascade(
-    entry: Arc<Mutex<LsEntry>>,
+impl FrameReader {
+    fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    fn drain(&mut self) -> anyhow::Result<Vec<ChatFrame>> {
+        let mut out = Vec::new();
+        loop {
+            if self.buf.len() < 5 {
+                break;
+            }
+            let flag = self.buf[0];
+            let len =
+                u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
+            if self.buf.len() < 5 + len {
+                break;
+            }
+            self.buf.advance(5);
+            let raw = self.buf.split_to(len).to_vec();
+            let payload = if flag == FRAME_GZIP_DATA || flag == FRAME_GZIP_TRAILER {
+                gunzip(&raw).unwrap_or(raw)
+            } else {
+                raw
+            };
+            out.push(ChatFrame {
+                payload,
+                is_trailer: flag == FRAME_TRAILER || flag == FRAME_GZIP_TRAILER,
+            });
+        }
+        Ok(out)
+    }
+}
+
+fn build_client(proxy_url: Option<&str>, timeout_ms: u64) -> anyhow::Result<Client> {
+    let mut builder = Client::builder().timeout(Duration::from_millis(timeout_ms.max(1_000)));
+    if let Some(proxy_url) = proxy_url.filter(|value| !value.trim().is_empty()) {
+        builder = builder.proxy(Proxy::all(proxy_url).context("账号代理不可用")?);
+    }
+    builder.build().context("创建远端请求客户端失败")
+}
+
+async fn fetch_user_jwt(
+    client: &Client,
     config: &EngineConfig,
     api_key: &str,
-    session_id: &str,
-) -> anyhow::Result<()> {
-    let (port, csrf, data_key, already_ready) = {
-        let entry = entry.lock().await;
-        (
-            entry.port,
-            entry.csrf.clone(),
-            entry.key.clone(),
-            entry.workspace_ready,
-        )
-    };
-    if already_ready {
-        return Ok(());
+) -> anyhow::Result<String> {
+    let url = format!(
+        "{}{}",
+        config.api_base_url.trim_end_matches('/'),
+        USER_JWT_PATH
+    );
+    let body = proto::build_user_jwt_request(api_key);
+    let response = client
+        .post(&url)
+        .header("user-agent", "connect-go/1.18.1 (go1.25.5)")
+        .header("content-type", "application/proto")
+        .header("connect-protocol-version", "1")
+        .header("accept-encoding", "gzip")
+        .body(body)
+        .send()
+        .await
+        .context("请求 Windsurf JWT 失败")?;
+    let status = response.status();
+    let mut body = response
+        .bytes()
+        .await
+        .context("读取 Windsurf JWT 响应失败")?
+        .to_vec();
+    if body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b {
+        body = gunzip(&body).context("Windsurf JWT 响应 gzip 解压失败")?;
     }
-    let workspace_id = &crate::sha256_hex(api_key)[..16];
-    let data_workspace = {
-        let entry = entry.lock().await;
-        tracing::debug!(
-            port = entry.port,
-            proxy = entry.proxy_url.as_deref().unwrap_or(""),
-            age_ms = entry.started_at.elapsed().as_millis(),
-            "准备 Cascade workspace warmup"
-        );
-        data_key
-    };
-    let workspace_dir = config
-        .data_dir
-        .join("ls-workspaces")
-        .join(data_workspace)
-        .join(format!("workspace-{workspace_id}"));
-    tokio::fs::create_dir_all(&workspace_dir).await?;
-    let workspace_path = workspace_dir.to_string_lossy().to_string();
-    let init = proto::build_initialize_panel_state_request(api_key, session_id);
-    grpc_unary(
-        port,
-        &csrf,
-        &format!("{LS_SERVICE}/InitializeCascadePanelState"),
-        init,
-        Duration::from_secs(5),
-    )
-    .await?;
-    let add_workspace = proto::build_add_tracked_workspace_request(&workspace_path);
-    grpc_unary(
-        port,
-        &csrf,
-        &format!("{LS_SERVICE}/AddTrackedWorkspace"),
-        add_workspace,
-        Duration::from_secs(5),
-    )
-    .await?;
-    let trust = proto::build_update_workspace_trust_request(api_key, true, session_id);
-    grpc_unary(
-        port,
-        &csrf,
-        &format!("{LS_SERVICE}/UpdateWorkspaceTrust"),
-        trust,
-        Duration::from_secs(5),
-    )
-    .await?;
-    let heartbeat = proto::build_heartbeat_request(api_key, session_id);
-    grpc_unary(
-        port,
-        &csrf,
-        &format!("{LS_SERVICE}/Heartbeat"),
-        heartbeat,
-        Duration::from_secs(5),
-    )
-    .await?;
-    entry.lock().await.workspace_ready = true;
-    Ok(())
+    if !status.is_success() {
+        let text = String::from_utf8_lossy(&body);
+        return Err(anyhow!(
+            "Windsurf JWT 返回 HTTP {}: {}",
+            status.as_u16(),
+            text.chars().take(300).collect::<String>()
+        ));
+    }
+    let text = String::from_utf8_lossy(&body);
+    extract_jwt(&text).ok_or_else(|| anyhow!("Windsurf JWT 响应中没有找到 token"))
 }
 
-async fn final_sweep(
-    port: u16,
-    csrf: &str,
-    cascade_id: &str,
-    yielded_by_step: &mut HashMap<usize, usize>,
-    chunks: &mut Vec<String>,
-) -> anyhow::Result<Vec<String>> {
-    let req = proto::build_get_cascade_trajectory_steps_request(cascade_id, 0);
-    let resp = grpc_unary(
-        port,
-        csrf,
-        &format!("{LS_SERVICE}/GetCascadeTrajectorySteps"),
-        req,
-        Duration::from_secs(30),
-    )
-    .await?;
-    let steps = proto::parse_trajectory_steps(&resp)?;
-    for (idx, step) in steps.iter().enumerate() {
-        if step.kind == 17 && !step.error_text.is_empty() {
-            return Err(anyhow!("Cascade 返回错误：{}", step.error_text));
+fn load_template(config: &EngineConfig, name: &str) -> anyhow::Result<Vec<u8>> {
+    let raw = if let Some(dir) = config.template_dir.as_ref() {
+        let path = dir.join(name);
+        if path.exists() {
+            std::fs::read(&path).with_context(|| format!("读取远端模板失败: {}", path.display()))?
+        } else {
+            builtin_template(name)?
         }
-        let response_text = step.response_text.as_str();
-        let prev = *yielded_by_step.get(&idx).unwrap_or(&0);
-        if response_text.len() > prev {
-            chunks.push(response_text[prev..].to_string());
-            yielded_by_step.insert(idx, response_text.len());
-        }
-        let cursor = *yielded_by_step.get(&idx).unwrap_or(&0);
-        if step.modified_text.len() > cursor && step.modified_text.starts_with(response_text) {
-            chunks.push(step.modified_text[cursor..].to_string());
-            yielded_by_step.insert(idx, step.modified_text.len());
-        }
-    }
-    Ok(chunks.clone())
+    } else {
+        builtin_template(name)?
+    };
+    decode_template_payload(&raw)
 }
 
-async fn grpc_unary(
-    port: u16,
-    csrf: &str,
-    path: &str,
-    payload: Vec<u8>,
-    timeout: Duration,
-) -> anyhow::Result<Vec<u8>> {
-    let framed = proto::grpc_frame(&payload);
-    let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
-    let (mut client, connection) = h2::client::handshake(tcp).await?;
-    tokio::spawn(async move {
-        let _ = connection.await;
+fn builtin_template(name: &str) -> anyhow::Result<Vec<u8>> {
+    match name {
+        "GetChatMessage_req.bin" => Ok(BUILTIN_GET_CHAT_MESSAGE.to_vec()),
+        _ => Err(anyhow!("缺少内置远端模板: {}", name)),
+    }
+}
+
+fn decode_template_payload(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if raw.len() >= 5 && raw[0] <= 3 {
+        let len = u32::from_be_bytes([raw[1], raw[2], raw[3], raw[4]]) as usize;
+        if 5 + len == raw.len() {
+            let payload = &raw[5..];
+            return if raw[0] == FRAME_GZIP_DATA || raw[0] == FRAME_GZIP_TRAILER {
+                gunzip(payload).context("远端模板 gzip 解压失败")
+            } else {
+                Ok(payload.to_vec())
+            };
+        }
+    }
+    if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+        return gunzip(raw).context("远端模板 raw gzip 解压失败");
+    }
+    Ok(raw.to_vec())
+}
+
+fn build_frame(payload: &[u8], compress: bool) -> anyhow::Result<Vec<u8>> {
+    let body = if compress {
+        gzip(payload)?
+    } else {
+        payload.to_vec()
+    };
+    let mut out = Vec::with_capacity(body.len() + 5);
+    out.push(if compress {
+        FRAME_GZIP_DATA
+    } else {
+        FRAME_DATA
     });
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(path)
-        .header("content-type", "application/grpc")
-        .header("te", "trailers")
-        .header("user-agent", "grpc-rust/0.1")
-        .header("x-codeium-csrf-token", csrf)
-        .body(())
-        .map_err(|err| anyhow!(err))?;
-    let response = tokio::time::timeout(timeout, async {
-        let (response, mut stream) = client.send_request(request, false)?;
-        stream.send_data(Bytes::from(framed), true)?;
-        let response = response.await?;
-        let mut body = response.into_body();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = body.data().await {
-            bytes.extend_from_slice(&chunk?);
-        }
-        Ok::<_, anyhow::Error>(bytes)
-    })
-    .await
-    .map_err(|_| anyhow!("gRPC 请求超时"))??;
-    proto::extract_grpc_payload(&response)
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    Ok(out)
 }
 
-async fn wait_port(port: u16, timeout: Duration) -> anyhow::Result<()> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+fn gzip(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(payload)?;
+    Ok(encoder.finish()?)
+}
+
+fn gunzip(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut decoder = GzDecoder::new(payload);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+fn session_key(
+    api_key: &str,
+    model: &EngineModel,
+    caller_session_key: Option<&str>,
+    messages: &[EngineMessage],
+) -> String {
+    let mut seed = format!(
+        "{}|model:{}",
+        account_key(api_key),
+        model.model_uid.as_deref().unwrap_or(&model.id)
+    );
+    if let Some(caller) = caller_session_key.filter(|value| !value.is_empty()) {
+        seed.push_str("|caller:");
+        seed.push_str(&short_hash(caller));
+        return seed;
     }
-    Err(anyhow!("LS 端口 {} 没有按时就绪", port))
-}
-
-async fn evict_one(pool: &mut HashMap<String, Arc<Mutex<LsEntry>>>) {
-    let Some(key) = pool.keys().next().cloned() else {
-        return;
-    };
-    if let Some(entry) = pool.remove(&key) {
-        let mut entry = entry.lock().await;
-        let _ = entry.child.kill().await;
+    seed.push_str("|messages:");
+    for message in messages.iter().take(8) {
+        seed.push('|');
+        seed.push_str(&message.role);
+        seed.push(':');
+        seed.push_str(&message.content.chars().take(200).collect::<String>());
     }
-}
-
-fn ls_key(proxy_url: Option<&str>, account_key: &str) -> String {
-    let proxy_part = match proxy_url.filter(|value| !value.is_empty()) {
-        Some(proxy) => {
-            let digest = crate::sha256_hex(proxy);
-            format!("px_{}", &digest[..16])
-        }
-        None => "default".to_string(),
-    };
-    format!("{proxy_part}_acct_{account_key}")
+    seed
 }
 
 fn account_key(api_key: &str) -> String {
-    crate::sha256_hex(api_key).chars().take(16).collect()
+    let prefix: String = api_key.chars().take(12).collect();
+    format!("remote:{prefix}:{}", api_key.len())
 }
 
-fn build_prompt(messages: &[EngineMessage]) -> String {
-    if messages.is_empty() {
-        return String::new();
-    }
-    let mut system = Vec::new();
-    let mut convo = Vec::new();
-    for msg in messages {
-        if msg.role == "system" {
-            system.push(msg.content.clone());
+fn short_hash(value: &str) -> String {
+    let mut hasher = sha2::Sha256::new();
+    sha2::Digest::update(&mut hasher, value.as_bytes());
+    hex::encode(sha2::Digest::finalize(hasher))
+        .chars()
+        .take(12)
+        .collect()
+}
+
+fn redact_log_text(value: &str) -> String {
+    let mut out = Vec::new();
+    for part in value.split_whitespace().take(80) {
+        let lower = part.to_ascii_lowercase();
+        let redacted = if lower.contains("authorization")
+            || lower.contains("cookie")
+            || lower.contains("api_key")
+            || lower.contains("apikey")
+            || lower.contains("access_token")
+            || lower.contains("refresh_token")
+            || lower.contains("jwt")
+            || lower.contains("token")
+            || is_jwt_like(part.trim_matches(|ch: char| {
+                !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+            })) {
+            "[redacted]"
         } else {
-            convo.push(msg);
+            part
+        };
+        out.push(redacted);
+    }
+    let mut text = out.join(" ");
+    if text.chars().count() > 300 {
+        text = text.chars().take(300).collect();
+    }
+    text
+}
+
+fn extract_jwt(text: &str) -> Option<String> {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.'))
+        .find(|part| is_jwt_like(part))
+        .map(str::to_string)
+}
+
+fn is_jwt_like(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let Some(header) = parts.next() else {
+        return false;
+    };
+    let Some(payload) = parts.next() else {
+        return false;
+    };
+    let Some(signature) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && header.starts_with("eyJ")
+        && !payload.is_empty()
+        && !signature.is_empty()
+}
+
+fn jwt_exp_sec(token: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64_url_decode(payload)?;
+    let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+    value.get("exp")?.as_i64()
+}
+
+fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buffer = 0_u32;
+    let mut bits = 0_u8;
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        } as u32;
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xff) as u8);
         }
     }
-    let mut out = String::new();
-    if !system.is_empty() {
-        out.push_str(&system.join("\n"));
-        out.push_str("\n\n");
-    }
-    if convo.len() <= 1 {
-        out.push_str(convo.last().map(|msg| msg.content.as_str()).unwrap_or(""));
-        return out;
-    }
-    out.push_str("The following is a multi-turn conversation. Use the prior turns as context.\n\n");
-    for msg in &convo[..convo.len() - 1] {
-        let tag = if msg.role == "assistant" {
-            "assistant"
-        } else {
-            "human"
-        };
-        out.push_str(&format!("<{tag}>\n{}\n</{tag}>\n\n", msg.content));
-    }
-    let latest = convo.last().unwrap();
-    out.push_str(&format!("<human>\n{}\n</human>", latest.content));
-    out
+    Some(out)
+}
+
+fn setting_string(settings: &HashMap<String, String>, key: &str) -> Option<String> {
+    settings.get(key).and_then(|value| {
+        serde_json::from_str::<String>(value)
+            .ok()
+            .or_else(|| Some(value.clone()))
+    })
 }
 
 fn setting_u64(settings: &HashMap<String, String>, key: &str, fallback: u64) -> u64 {
@@ -560,17 +759,6 @@ fn setting_u64(settings: &HashMap<String, String>, key: &str, fallback: u64) -> 
         .get(key)
         .and_then(|value| {
             serde_json::from_str::<u64>(value)
-                .ok()
-                .or_else(|| value.parse().ok())
-        })
-        .unwrap_or(fallback)
-}
-
-fn setting_usize(settings: &HashMap<String, String>, key: &str, fallback: usize) -> usize {
-    settings
-        .get(key)
-        .and_then(|value| {
-            serde_json::from_str::<usize>(value)
                 .ok()
                 .or_else(|| value.parse().ok())
         })

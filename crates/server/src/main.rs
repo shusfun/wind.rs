@@ -2,11 +2,11 @@ use anyhow::Context;
 use async_stream::stream;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{
         IntoResponse, Response,
-        sse::{Event, Sse},
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{get, get_service, patch, post},
 };
@@ -19,9 +19,14 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use std::{
-    collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration as StdDuration,
+    collections::HashMap,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration as StdDuration, Instant},
 };
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
@@ -31,7 +36,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use uuid::Uuid;
 
 mod engine;
-use engine::{EngineAccount, EngineConfig, EngineMessage, EngineModel, WindsurfEngine};
+use engine::{EngineAccount, EngineConfig, EngineMessage, EngineModel, RemoteApiEngine};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -48,13 +53,15 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     db: SqlitePool,
-    engine: WindsurfEngine,
+    engine: RemoteApiEngine,
+    events: broadcast::Sender<AdminEvent>,
 }
 
 #[derive(Clone)]
 struct AccountScheduler {
     db: SqlitePool,
     capacity: CapacitySettings,
+    events: broadcast::Sender<AdminEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +69,7 @@ struct AccountLease {
     account_id: i64,
     email: String,
     api_key: String,
+    jwt_token: Option<String>,
     reservation_id: String,
     sticky: bool,
     caller_key: Option<String>,
@@ -79,10 +87,17 @@ struct SchedulerAccount {
     current_concurrent: i64,
     last_used_at: Option<String>,
     rate_limited_until: Option<String>,
+    rate_limit_probe_after: Option<String>,
     rpm_limit: i64,
     credits_json: Option<String>,
     blocked_models_json: Option<String>,
     credentials_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AccountCredentials {
+    api_key: String,
+    jwt_token: Option<String>,
 }
 
 #[derive(Debug)]
@@ -92,6 +107,7 @@ enum AcquireError {
     TemporarilyUnavailable {
         retry_after_secs: i64,
         reason: String,
+        upstream_error: Option<String>,
     },
     Db(anyhow::Error),
 }
@@ -112,6 +128,44 @@ struct ErrorBody {
     #[serde(rename = "type")]
     kind: String,
     message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminEvent {
+    kind: String,
+    payload: Value,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AvailabilityKind {
+    Available,
+    Probing,
+    AccountRateLimited,
+    ModelRateLimited,
+    RpmFull,
+    TierExpired,
+    ModelBlocked,
+    CredentialMissing,
+    ConcurrencyFull,
+    StatusError,
+    StatusDisabled,
+    StatusBanned,
+    StatusUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamRateLimitScope {
+    Model,
+    Account,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpstreamRateLimit {
+    scope: UpstreamRateLimitScope,
+    retry_after_secs: i64,
 }
 
 #[derive(Deserialize)]
@@ -170,6 +224,22 @@ struct CreateLoginJobRequest {
     fail_delay_max_secs: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateClientApiKeyRequest {
+    name: Option<String>,
+    key: Option<String>,
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateClientApiKeyRequest {
+    name: Option<String>,
+    key: Option<String>,
+    enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 struct LoginEntry {
     email: String,
@@ -225,17 +295,32 @@ struct AuthMethodInfo {
 struct MessagesRequest {
     model: Option<String>,
     stream: Option<bool>,
+    max_tokens: Option<u64>,
+    system: Option<Value>,
+    tools: Option<Value>,
+    tool_choice: Option<Value>,
+    #[serde(default)]
+    metadata: Value,
     #[serde(default)]
     messages: Value,
 }
 
+#[derive(Debug, Clone)]
+struct MessageDebugSummary {
+    message_count: usize,
+    roles: Vec<String>,
+    system_chars: usize,
+    tool_count: usize,
+    has_tool_choice: bool,
+    metadata_keys: Vec<String>,
+    input_chars: usize,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AccountTestRequest {
-    account_id: Option<i64>,
+struct AccountProbeRequest {
     model: String,
     message: String,
-    stream: Option<bool>,
     save_defaults: Option<bool>,
 }
 
@@ -253,6 +338,8 @@ struct CapacitySettings {
     suspicious_cooldown_secs: i64,
     sticky_session_minutes: i64,
 }
+
+const RATE_LIMIT_PROBE_INTERVAL_SECS: i64 = 300;
 
 impl Default for CapacitySettings {
     fn default() -> Self {
@@ -273,9 +360,8 @@ impl Default for CapacitySettings {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
-        .init();
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt().with_env_filter(env_filter).init();
 
     let args = Args::parse();
     std::fs::create_dir_all(&args.data_dir).with_context(|| {
@@ -294,11 +380,12 @@ async fn main() -> anyhow::Result<()> {
     run_migrations(&db).await?;
 
     let settings = settings_map(&db).await.unwrap_or_default();
-    let engine = WindsurfEngine::new(EngineConfig::from_settings(
+    let engine = RemoteApiEngine::new(EngineConfig::from_settings(
         &settings,
         args.data_dir.clone(),
     ));
-    let state = AppState { db, engine };
+    let (events, _) = broadcast::channel(512);
+    let state = AppState { db, engine, events };
     let app = router(state, args.static_dir);
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
@@ -318,16 +405,24 @@ fn router(state: AppState, static_dir: Option<PathBuf>) -> Router {
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/admin/accounts", get(accounts_list).post(accounts_create))
+        .route("/admin/events", get(admin_events_stream))
         .route(
             "/admin/accounts/{id}",
             patch(accounts_update).delete(accounts_delete),
         )
-        .route("/admin/accounts/probe-all", post(accounts_probe_all))
+        .route(
+            "/admin/accounts/refresh-status",
+            post(accounts_refresh_status_all),
+        )
         .route(
             "/admin/accounts/refresh-credits",
             post(accounts_refresh_credits_all),
         )
         .route("/admin/accounts/{id}/probe", post(account_probe))
+        .route(
+            "/admin/accounts/probe-defaults",
+            get(account_probe_defaults),
+        )
         .route(
             "/admin/accounts/{id}/refresh-credits",
             post(account_refresh_credits),
@@ -355,13 +450,17 @@ fn router(state: AppState, static_dir: Option<PathBuf>) -> Router {
             get(login_job_events_stream),
         )
         .route("/admin/login-jobs/{id}/cancel", post(login_job_cancel))
+        .route(
+            "/admin/client-api-keys",
+            get(client_api_keys_list).post(client_api_keys_create),
+        )
+        .route(
+            "/admin/client-api-keys/{id}",
+            patch(client_api_keys_update).delete(client_api_keys_delete),
+        )
         .route("/admin/requests", get(requests_list))
         .route("/admin/requests/{id}", get(request_detail))
         .route("/admin/capacity", get(capacity_get).put(capacity_put))
-        .route(
-            "/admin/account-test",
-            get(account_test_defaults).post(account_test),
-        )
         .route("/admin/settings", get(settings_get).put(settings_put))
         .with_state(Arc::new(state));
 
@@ -387,7 +486,80 @@ async fn run_migrations(db: &SqlitePool) -> anyhow::Result<()> {
         }
     }
     ensure_account_columns(db).await?;
+    ensure_client_api_keys(db).await?;
     cleanup_runtime_state(db).await?;
+    Ok(())
+}
+
+async fn ensure_client_api_keys(db: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS client_api_keys (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          key_value TEXT,
+          key_hash TEXT NOT NULL UNIQUE,
+          key_mask TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          last_used_at TEXT
+        )",
+    )
+    .execute(db)
+    .await?;
+    ensure_client_api_key_columns(db).await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_client_api_keys_enabled
+          ON client_api_keys(enabled, key_hash)",
+    )
+    .execute(db)
+    .await?;
+    migrate_client_api_keys_setting(db).await?;
+    Ok(())
+}
+
+async fn ensure_client_api_key_columns(db: &SqlitePool) -> anyhow::Result<()> {
+    let existing_rows = sqlx::query("PRAGMA table_info(client_api_keys)")
+        .fetch_all(db)
+        .await?;
+    let existing: std::collections::HashSet<String> = existing_rows
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect();
+    if !existing.contains("key_value") {
+        sqlx::query("ALTER TABLE client_api_keys ADD COLUMN key_value TEXT")
+            .execute(db)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn migrate_client_api_keys_setting(db: &SqlitePool) -> anyhow::Result<()> {
+    let keys = client_api_keys_from_settings(db).await?;
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let now_text = now();
+    for (index, key) in keys.into_iter().enumerate() {
+        let name = format!("调用密钥 {}", index + 1);
+        let hash = sha256_hex(&key);
+        let mask = mask_secret(&key);
+        sqlx::query(
+            "INSERT OR IGNORE INTO client_api_keys (name, key_value, key_hash, key_mask, enabled, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 1, ?, ?)",
+        )
+        .bind(name)
+        .bind(&key)
+        .bind(hash)
+        .bind(mask)
+        .bind(&now_text)
+        .bind(&now_text)
+        .execute(db)
+        .await?;
+    }
+    sqlx::query("DELETE FROM settings WHERE key='client_api_keys'")
+        .execute(db)
+        .await?;
     Ok(())
 }
 
@@ -399,6 +571,7 @@ async fn ensure_account_columns(db: &SqlitePool) -> anyhow::Result<()> {
         ("last_used_at", "TEXT"),
         ("last_probed_at", "TEXT"),
         ("rate_limited_until", "TEXT"),
+        ("rate_limit_probe_after", "TEXT"),
         ("rpm_used", "INTEGER NOT NULL DEFAULT 0"),
         ("rpm_limit", "INTEGER NOT NULL DEFAULT 60"),
         ("credits_json", "TEXT"),
@@ -436,6 +609,23 @@ async fn ensure_account_columns(db: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(db)
     .await?;
+    ensure_account_model_rate_limit_columns(db).await?;
+    Ok(())
+}
+
+async fn ensure_account_model_rate_limit_columns(db: &SqlitePool) -> anyhow::Result<()> {
+    let existing_rows = sqlx::query("PRAGMA table_info(account_model_rate_limits)")
+        .fetch_all(db)
+        .await?;
+    let existing: std::collections::HashSet<String> = existing_rows
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect();
+    if !existing.contains("probe_after") {
+        sqlx::query("ALTER TABLE account_model_rate_limits ADD COLUMN probe_after TEXT")
+            .execute(db)
+            .await?;
+    }
     Ok(())
 }
 
@@ -572,7 +762,14 @@ async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
     })
 }
 
-async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn models(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = require_client_api_key(&state.db, &headers, Some(&query)).await {
+        return resp;
+    }
     let models = model_catalog(&state.db).await;
     Json(json!({
         "object": "list",
@@ -584,58 +781,99 @@ async fn models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             "_windsurf": model
         })).collect::<Vec<_>>()
     }))
+    .into_response()
 }
 
 async fn messages(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
     Json(payload): Json<MessagesRequest>,
 ) -> impl IntoResponse {
+    if let Err(resp) = require_client_api_key(&state.db, &headers, Some(&query)).await {
+        return resp;
+    }
+    let started_at = Instant::now();
     let trace_id = Uuid::new_v4().to_string();
     let model = payload
         .model
         .clone()
         .unwrap_or_else(|| "claude-opus-4-1".to_string());
     let stream_requested = payload.stream.unwrap_or(false);
-    let _ = create_trace(&state.db, &trace_id, Some(&model), stream_requested).await;
-    let _ = add_trace_chunk(
+    let debug_summary = message_debug_summary(&payload);
+    let request_snapshot = sanitized_message_request(&payload, &debug_summary);
+    if let Err(err) = create_trace(&state.db, &trace_id, Some(&model), stream_requested).await {
+        tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages trace create failed");
+    }
+    if let Err(err) = add_trace_chunk(
         &state.db,
         &trace_id,
-        "client_request",
-        &json!(payload.messages),
+        "client_request_summary",
+        &request_snapshot,
     )
-    .await;
-    let caller_key = extract_caller_key(&headers, &payload.messages);
+    .await
+    {
+        tracing::debug!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages trace chunk write failed");
+    }
+    let caller_payload = json!({
+        "metadata": payload.metadata,
+        "messages": payload.messages,
+    });
+    let caller_key = extract_caller_key(&headers, &caller_payload);
+    let caller_key_hash = caller_key.as_deref().map(short_hash);
+    tracing::info!(
+        trace_id = %trace_id,
+        model = %model,
+        stream = stream_requested,
+        message_count = debug_summary.message_count,
+        caller_key_hash = caller_key_hash.as_deref().unwrap_or("none"),
+        "messages request start"
+    );
+    tracing::debug!(
+        trace_id = %trace_id,
+        max_tokens = payload.max_tokens.unwrap_or(0),
+        roles = ?debug_summary.roles,
+        system_chars = debug_summary.system_chars,
+        tool_count = debug_summary.tool_count,
+        has_tool_choice = debug_summary.has_tool_choice,
+        metadata_keys = ?debug_summary.metadata_keys,
+        input_chars = debug_summary.input_chars,
+        "messages request summary"
+    );
     let capacity = capacity_settings(&state.db).await.unwrap_or_default();
-    let scheduler = AccountScheduler::new(state.db.clone(), capacity.clone());
+    let scheduler = AccountScheduler::new(state.db.clone(), capacity.clone(), state.events.clone());
     let mut lease = match scheduler.acquire(&model, caller_key.clone()).await {
         Ok(lease) => lease,
         Err(AcquireError::TemporarilyUnavailable {
             retry_after_secs,
             reason,
+            upstream_error,
         }) => {
-            let message = format!("账号池暂时不可用，请 {} 秒后重试", retry_after_secs);
-            let _ = finish_trace(&state.db, &trace_id, "error", None, Some(&reason)).await;
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(
-                    header::RETRY_AFTER,
-                    HeaderValue::from_str(&retry_after_secs.to_string())
-                        .unwrap_or_else(|_| HeaderValue::from_static("60")),
-                )],
-                Json(json!({
-                    "error": {
-                        "type": "rate_limit_exceeded",
-                        "message": message,
-                        "retry_after": retry_after_secs,
-                        "reason": reason
-                    }
-                })),
-            )
-                .into_response();
+            let client_message = upstream_error.as_deref().unwrap_or(&reason);
+            tracing::warn!(
+                trace_id = %trace_id,
+                retry_after_secs,
+                reason = %reason,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "messages scheduler unavailable"
+            );
+            if let Err(err) = finish_trace(&state.db, &trace_id, "error", None, Some(&reason)).await
+            {
+                tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages trace finish failed");
+            }
+            return rate_limited_response(client_message, retry_after_secs);
         }
         Err(AcquireError::NoAccount) => {
-            let _ = finish_trace(&state.db, &trace_id, "error", None, Some("没有可用账号")).await;
+            tracing::warn!(
+                trace_id = %trace_id,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "messages scheduler no account"
+            );
+            if let Err(err) =
+                finish_trace(&state.db, &trace_id, "error", None, Some("没有可用账号")).await
+            {
+                tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages trace finish failed");
+            }
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "pool_exhausted",
@@ -643,7 +881,17 @@ async fn messages(
             );
         }
         Err(AcquireError::Db(err)) => {
-            let _ = finish_trace(&state.db, &trace_id, "error", None, Some(&err.to_string())).await;
+            tracing::error!(
+                trace_id = %trace_id,
+                error = %redact_log_text(&err.to_string()),
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "messages scheduler db error"
+            );
+            if let Err(trace_err) =
+                finish_trace(&state.db, &trace_id, "error", None, Some(&err.to_string())).await
+            {
+                tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+            }
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "scheduler_error",
@@ -651,8 +899,29 @@ async fn messages(
             );
         }
     };
-    let _ = bind_trace_account(&state.db, &trace_id, lease.account_id).await;
-    let _ = add_trace_chunk(
+    tracing::info!(
+        trace_id = %trace_id,
+        account_id = lease.account_id,
+        model = %model,
+        sticky = lease.sticky,
+        reservation_id = %lease.reservation_id,
+        "messages account acquired"
+    );
+    emit_admin_event(
+        &state.events,
+        "account_request_started",
+        json!({
+            "accountId": lease.account_id,
+            "email": lease.email,
+            "model": model,
+            "traceId": trace_id,
+            "sticky": lease.sticky
+        }),
+    );
+    if let Err(err) = bind_trace_account(&state.db, &trace_id, lease.account_id).await {
+        tracing::warn!(trace_id = %trace_id, account_id = lease.account_id, error = %redact_log_text(&err.to_string()), "messages trace account bind failed");
+    }
+    if let Err(err) = add_trace_chunk(
         &state.db,
         &trace_id,
         "account_acquired",
@@ -664,21 +933,37 @@ async fn messages(
             "reservationId": lease.reservation_id
         }),
     )
-    .await;
+    .await
+    {
+        tracing::debug!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages trace chunk write failed");
+    }
+    let engine_messages = messages_from_request(&payload);
+    let estimated_input_tokens = estimate_input_tokens_from_messages(&engine_messages);
+    let engine_session_key = caller_key
+        .clone()
+        .unwrap_or_else(|| format!("trace:{trace_id}"));
+    tracing::debug!(
+        trace_id = %trace_id,
+        engine_message_count = engine_messages.len(),
+        estimated_input_tokens,
+        "messages converted for upstream"
+    );
 
     if stream_requested {
         let db = state.db.clone();
         let capacity_for_stream = capacity.clone();
+        let events_for_stream = state.events.clone();
         let engine = state.engine.clone();
         let engine_account = EngineAccount {
             api_key: lease.api_key.clone(),
+            jwt_token: lease.jwt_token.clone(),
             proxy_url: proxy_url_for_account(&state.db, lease.account_id).await,
         };
         let engine_model = resolve_engine_model(&model);
-        let engine_messages = messages_from_anthropic(&payload.messages);
         let trace = trace_id.clone();
         let model_for_stream = model.clone();
         let s = stream! {
+            let stream_started_at = Instant::now();
             let start = json!({
                 "type": "message_start",
                 "message": {
@@ -689,44 +974,134 @@ async fn messages(
                     "content": [],
                     "stop_reason": null,
                     "stop_sequence": null,
-                    "usage": { "input_tokens": 1, "output_tokens": 0 }
+                    "usage": { "input_tokens": estimated_input_tokens, "output_tokens": 0 }
                 }
             });
+            tracing::info!(trace_id = %trace, model = %model_for_stream, estimated_input_tokens, "messages stream start");
             yield Ok::<Event, std::convert::Infallible>(Event::default().data(start.to_string()));
-            match engine.cascade_stream(engine_account, engine_model, engine_messages).await {
+            match engine
+                .messages_stream(
+                    Some(trace.clone()),
+                    Some(engine_session_key),
+                    engine_account,
+                    engine_model,
+                    engine_messages,
+                )
+                .await
+            {
                 Ok(upstream) => {
                     use futures_util::StreamExt;
                     futures_util::pin_mut!(upstream);
+                    let mut input_tokens = estimated_input_tokens as i64;
                     let mut output_tokens = 0_i64;
+                    let mut chunk_count = 0_u64;
+                    let mut first_chunk_logged = false;
+                    let mut content_block_started = false;
                     while let Some(item) = upstream.next().await {
                         match item {
                             Ok(chunk) => {
+                                if !content_block_started {
+                                    content_block_started = true;
+                                    let content_start = json!({
+                                        "type": "content_block_start",
+                                        "index": 0,
+                                        "content_block": { "type": "text", "text": "" }
+                                    });
+                                    if let Err(err) = add_trace_chunk(&db, &trace, "downstream_event", &content_start).await {
+                                        tracing::debug!(trace_id = %trace, error = %redact_log_text(&err.to_string()), "messages trace chunk write failed");
+                                    }
+                                    yield Ok(Event::default().data(content_start.to_string()));
+                                }
+                                chunk_count += 1;
+                                if !first_chunk_logged {
+                                    first_chunk_logged = true;
+                    tracing::debug!(
+                        trace_id = %trace,
+                        first_chunk_ms = stream_started_at.elapsed().as_millis() as u64,
+                        "messages stream first chunk"
+                                    );
+                                }
+                                if let Some(tokens) = chunk.prompt_tokens {
+                                    input_tokens = tokens as i64;
+                                }
                                 output_tokens += (chunk.text.chars().count() as i64 / 4).max(1);
+                                if let Some(tokens) = chunk.completion_tokens {
+                                    output_tokens = tokens as i64;
+                                }
                                 let delta = json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": chunk.text}});
-                                let _ = add_trace_chunk(&db, &trace, "downstream_event", &delta).await;
+                                tracing::debug!(
+                                    trace_id = %trace,
+                                    chunk_count,
+                                    text_chars = delta.pointer("/delta/text").and_then(|value| value.as_str()).map(|value| value.chars().count()).unwrap_or(0),
+                                    output_tokens,
+                                    "messages stream downstream chunk"
+                                );
+                                if let Err(err) = add_trace_chunk(&db, &trace, "downstream_event", &delta).await {
+                                    tracing::debug!(trace_id = %trace, error = %redact_log_text(&err.to_string()), "messages trace chunk write failed");
+                                }
                                 yield Ok(Event::default().data(delta.to_string()));
                             }
                             Err(err) => {
-                                let _ = finish_trace(&db, &trace, "error", None, Some(&err.to_string())).await;
-                                let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone());
-                                let _ = scheduler.mark_error(&mut lease, &err.to_string()).await;
-                                yield Ok(Event::default().data(json!({"type":"error","error":{"type":"api_error","message":err.to_string()}}).to_string()));
+                                let error_summary = redact_log_text(&err.to_string());
+                                tracing::error!(
+                                    trace_id = %trace,
+                                    error = %error_summary,
+                                    elapsed_ms = stream_started_at.elapsed().as_millis() as u64,
+                                    chunk_count,
+                                    "messages stream upstream error"
+                                );
+                            if let Err(trace_err) = finish_trace(&db, &trace, "error", None, Some(&err.to_string())).await {
+                                tracing::warn!(trace_id = %trace, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+                            }
+                            let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone(), events_for_stream.clone());
+                            if let Err(mark_err) = scheduler.mark_failure(&mut lease, &err.to_string()).await {
+                                    tracing::warn!(trace_id = %trace, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
+                                }
+                            let error_kind = anthropic_error_type_for_upstream(&err.to_string());
+                            yield Ok(Event::default().data(json!({"type":"error","error":{"type":error_kind,"message":err.to_string()}}).to_string()));
                                 return;
                             }
                         }
                     }
-                    let stop = json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": output_tokens}});
+                    if content_block_started {
+                        yield Ok(Event::default().data(json!({"type": "content_block_stop", "index": 0}).to_string()));
+                    }
+                    let stop = json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}});
                     yield Ok(Event::default().data(stop.to_string()));
                     yield Ok(Event::default().data(json!({"type": "message_stop"}).to_string()));
-                    let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone());
-                    let _ = scheduler.mark_success(&mut lease).await;
-                    let _ = finish_trace(&db, &trace, "ok", Some("end_turn"), None).await;
+                    let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone(), events_for_stream.clone());
+                    if let Err(mark_err) = scheduler.mark_success(&mut lease).await {
+                        tracing::warn!(trace_id = %trace, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark success failed");
+                    }
+                    if let Err(trace_err) = finish_trace(&db, &trace, "ok", Some("end_turn"), None).await {
+                        tracing::warn!(trace_id = %trace, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+                    }
+                    tracing::info!(
+                        trace_id = %trace,
+                        elapsed_ms = stream_started_at.elapsed().as_millis() as u64,
+                        chunk_count,
+                        input_tokens,
+                        output_tokens,
+                        "messages stream complete"
+                    );
                 }
                 Err(err) => {
-                    let _ = finish_trace(&db, &trace, "error", None, Some(&err.to_string())).await;
-                    let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone());
-                    let _ = scheduler.mark_error(&mut lease, &err.to_string()).await;
-                    yield Ok(Event::default().data(json!({"type":"error","error":{"type":"api_error","message":err.to_string()}}).to_string()));
+                    let error_summary = redact_log_text(&err.to_string());
+                    tracing::error!(
+                        trace_id = %trace,
+                        error = %error_summary,
+                        elapsed_ms = stream_started_at.elapsed().as_millis() as u64,
+                        "messages stream open upstream failed"
+                    );
+                    if let Err(trace_err) = finish_trace(&db, &trace, "error", None, Some(&err.to_string())).await {
+                        tracing::warn!(trace_id = %trace, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+                    }
+                    let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone(), events_for_stream.clone());
+                    if let Err(mark_err) = scheduler.mark_failure(&mut lease, &err.to_string()).await {
+                        tracing::warn!(trace_id = %trace, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
+                    }
+                    let error_kind = anthropic_error_type_for_upstream(&err.to_string());
+                    yield Ok(Event::default().data(json!({"type":"error","error":{"type":error_kind,"message":err.to_string()}}).to_string()));
                 }
             }
         };
@@ -735,13 +1110,21 @@ async fn messages(
         let engine = state.engine.clone();
         let engine_account = EngineAccount {
             api_key: lease.api_key.clone(),
+            jwt_token: lease.jwt_token.clone(),
             proxy_url: proxy_url_for_account(&state.db, lease.account_id).await,
         };
         let engine_model = resolve_engine_model(&model);
-        let engine_messages = messages_from_anthropic(&payload.messages);
+        let mut input_tokens = estimated_input_tokens;
         let mut text = String::new();
+        let mut chunk_count = 0_u64;
         match engine
-            .cascade_stream(engine_account, engine_model, engine_messages)
+            .messages_stream(
+                Some(trace_id.clone()),
+                Some(engine_session_key),
+                engine_account,
+                engine_model,
+                engine_messages,
+            )
             .await
         {
             Ok(upstream) => {
@@ -749,31 +1132,62 @@ async fn messages(
                 futures_util::pin_mut!(upstream);
                 while let Some(item) = upstream.next().await {
                     match item {
-                        Ok(chunk) => text.push_str(&chunk.text),
+                        Ok(chunk) => {
+                            chunk_count += 1;
+                            if let Some(tokens) = chunk.prompt_tokens {
+                                input_tokens = tokens;
+                            }
+                            if !chunk.text.is_empty() {
+                                text.push_str(&chunk.text);
+                            }
+                        }
                         Err(err) => {
-                            let _ = scheduler.mark_error(&mut lease, &err.to_string()).await;
-                            let _ = finish_trace(
+                            let error_summary = redact_log_text(&err.to_string());
+                            tracing::error!(
+                                trace_id = %trace_id,
+                                error = %error_summary,
+                                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                chunk_count,
+                                "messages nonstream upstream error"
+                            );
+                            if let Err(mark_err) =
+                                scheduler.mark_failure(&mut lease, &err.to_string()).await
+                            {
+                                tracing::warn!(trace_id = %trace_id, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
+                            }
+                            if let Err(trace_err) = finish_trace(
                                 &state.db,
                                 &trace_id,
                                 "error",
                                 None,
                                 Some(&err.to_string()),
                             )
-                            .await;
-                            return error(
-                                StatusCode::BAD_GATEWAY,
-                                "upstream_error",
-                                &err.to_string(),
-                            );
+                            .await
+                            {
+                                tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+                            }
+                            return upstream_messages_error_response(&err.to_string());
                         }
                     }
                 }
             }
             Err(err) => {
-                let _ = scheduler.mark_error(&mut lease, &err.to_string()).await;
-                let _ =
-                    finish_trace(&state.db, &trace_id, "error", None, Some(&err.to_string())).await;
-                return error(StatusCode::BAD_GATEWAY, "upstream_error", &err.to_string());
+                let error_summary = redact_log_text(&err.to_string());
+                tracing::error!(
+                    trace_id = %trace_id,
+                    error = %error_summary,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "messages nonstream open upstream failed"
+                );
+                if let Err(mark_err) = scheduler.mark_failure(&mut lease, &err.to_string()).await {
+                    tracing::warn!(trace_id = %trace_id, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
+                }
+                if let Err(trace_err) =
+                    finish_trace(&state.db, &trace_id, "error", None, Some(&err.to_string())).await
+                {
+                    tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+                }
+                return upstream_messages_error_response(&err.to_string());
             }
         }
         let output_tokens = (text.chars().count() as f64 / 4.0).ceil() as u64;
@@ -785,19 +1199,93 @@ async fn messages(
             "content": [{ "type": "text", "text": text }],
             "stop_reason": "end_turn",
             "stop_sequence": null,
-            "usage": { "input_tokens": 1, "output_tokens": output_tokens }
+            "usage": { "input_tokens": input_tokens, "output_tokens": output_tokens }
         });
-        let _ = add_trace_chunk(&state.db, &trace_id, "downstream_response", &response).await;
-        let _ = scheduler.mark_success(&mut lease).await;
-        let _ = finish_trace(&state.db, &trace_id, "ok", Some("end_turn"), None).await;
+        if let Err(err) =
+            add_trace_chunk(&state.db, &trace_id, "downstream_response", &response).await
+        {
+            tracing::debug!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages trace chunk write failed");
+        }
+        if let Err(err) = scheduler.mark_success(&mut lease).await {
+            tracing::warn!(trace_id = %trace_id, account_id = lease.account_id, error = %redact_log_text(&err.to_string()), "messages account mark success failed");
+        }
+        if let Err(err) = finish_trace(&state.db, &trace_id, "ok", Some("end_turn"), None).await {
+            tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages trace finish failed");
+        }
+        tracing::info!(
+            trace_id = %trace_id,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            chunk_count,
+            input_tokens,
+            output_tokens,
+            "messages nonstream complete"
+        );
         Json(response).into_response()
     }
 }
 
-async fn count_tokens(Json(payload): Json<Value>) -> impl IntoResponse {
+async fn count_tokens(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    if let Err(resp) = require_client_api_key(&state.db, &headers, Some(&query)).await {
+        return resp;
+    }
     let raw = payload.to_string();
     let tokens = (raw.chars().count() as f64 / 4.0).ceil() as u64;
-    Json(json!({ "input_tokens": tokens.max(1) }))
+    Json(json!({ "input_tokens": tokens.max(1) })).into_response()
+}
+
+fn emit_admin_event(events: &broadcast::Sender<AdminEvent>, kind: &str, payload: Value) {
+    let _ = events.send(AdminEvent {
+        kind: kind.to_string(),
+        payload,
+        created_at: now(),
+    });
+}
+
+fn emit_account_event(events: &broadcast::Sender<AdminEvent>, action: &str, account_id: i64) {
+    emit_admin_event(
+        events,
+        "account_changed",
+        json!({ "action": action, "accountId": account_id }),
+    );
+}
+
+async fn admin_events_stream(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&state.db, &headers).await {
+        return resp;
+    }
+    let mut rx = state.events.subscribe();
+    let s = stream! {
+        yield Ok::<Event, std::convert::Infallible>(
+            Event::default()
+                .event("ready")
+                .data(json!({ "kind": "ready", "createdAt": now() }).to_string()),
+        );
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+                    yield Ok(Event::default().event(&event.kind).data(data));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    yield Ok(Event::default().event("resync").data(json!({
+                        "kind": "resync",
+                        "payload": { "skipped": skipped },
+                        "createdAt": now()
+                    }).to_string()));
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(s).keep_alive(KeepAlive::default()).into_response()
 }
 
 async fn accounts_list(
@@ -808,7 +1296,7 @@ async fn accounts_list(
         return resp;
     }
     let capacity = capacity_settings(&state.db).await.unwrap_or_default();
-    let scheduler = AccountScheduler::new(state.db.clone(), capacity.clone());
+    let scheduler = AccountScheduler::new(state.db.clone(), capacity.clone(), state.events.clone());
     let _ = scheduler.cleanup_expired().await;
     let _ = refresh_rpm_counters(&state.db).await;
     let rows = match sqlx::query("SELECT * FROM accounts ORDER BY id DESC")
@@ -828,10 +1316,25 @@ async fn accounts_list(
         .await
         .unwrap_or_default();
     let sticky_counts = account_sticky_counts(&state.db).await.unwrap_or_default();
-    let accounts: Vec<Value> = rows
-        .into_iter()
-        .map(|row| account_json(row, &model_limits, &sticky_counts))
-        .collect();
+    let default_model = get_setting_string(&state.db, "account_probe_model")
+        .await
+        .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+    let mut accounts = Vec::new();
+    for row in rows {
+        let scheduler_account = scheduler_account_from_row(&row);
+        let availability = scheduler
+            .availability(&scheduler_account, &default_model)
+            .await
+            .unwrap_or_else(|_| {
+                AccountAvailability::unavailable(AvailabilityKind::StatusUnavailable, 60)
+            });
+        accounts.push(account_json(
+            row,
+            &model_limits,
+            &sticky_counts,
+            Some(&availability),
+        ));
+    }
     Json(ApiResponse {
         success: true,
         data: json!({ "accounts": accounts }),
@@ -974,11 +1477,14 @@ async fn accounts_create(
         );
     };
     match result {
-        Ok(id) => Json(ApiResponse {
-            success: true,
-            data: json!({ "id": id }),
-        })
-        .into_response(),
+        Ok(id) => {
+            emit_account_event(&state.events, "saved", id);
+            Json(ApiResponse {
+                success: true,
+                data: json!({ "id": id }),
+            })
+            .into_response()
+        }
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &err),
     }
 }
@@ -1046,7 +1552,10 @@ async fn accounts_update(
         .execute(&state.db)
         .await
     {
-        Ok(_) => Json(ApiResponse { success: true, data: json!({}) }).into_response(),
+        Ok(_) => {
+            emit_account_event(&state.events, "updated", id);
+            Json(ApiResponse { success: true, data: json!({}) }).into_response()
+        }
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &err.to_string()),
     }
 }
@@ -1064,11 +1573,14 @@ async fn accounts_delete(
         .execute(&state.db)
         .await
     {
-        Ok(_) => Json(ApiResponse {
-            success: true,
-            data: json!({}),
-        })
-        .into_response(),
+        Ok(_) => {
+            emit_account_event(&state.events, "deleted", id);
+            Json(ApiResponse {
+                success: true,
+                data: json!({}),
+            })
+            .into_response()
+        }
         Err(err) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "db_error",
@@ -1092,7 +1604,10 @@ async fn account_reset_errors(
         .execute(&state.db)
         .await
     {
-        Ok(_) => Json(ApiResponse { success: true, data: json!({}) }).into_response(),
+        Ok(_) => {
+            emit_account_event(&state.events, "reset_errors", id);
+            Json(ApiResponse { success: true, data: json!({}) }).into_response()
+        }
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &err.to_string()),
     }
 }
@@ -1143,7 +1658,7 @@ async fn account_clear_rate_limit(
         return resp;
     }
     let capacity = capacity_settings(&state.db).await.unwrap_or_default();
-    let scheduler = AccountScheduler::new(state.db.clone(), capacity.clone());
+    let scheduler = AccountScheduler::new(state.db.clone(), capacity.clone(), state.events.clone());
     match scheduler.clear_rate_limit(id).await {
         Ok(_) => Json(ApiResponse {
             success: true,
@@ -1167,7 +1682,7 @@ async fn account_clear_sticky(
         return resp;
     }
     let capacity = capacity_settings(&state.db).await.unwrap_or_default();
-    let scheduler = AccountScheduler::new(state.db.clone(), capacity);
+    let scheduler = AccountScheduler::new(state.db.clone(), capacity, state.events.clone());
     match scheduler.clear_sticky_for_account(id).await {
         Ok(_) => Json(ApiResponse {
             success: true,
@@ -1191,11 +1706,14 @@ async fn account_refresh_credits(
         return resp;
     }
     match refresh_account_status(&state.db, id, false).await {
-        Ok(value) => Json(ApiResponse {
-            success: true,
-            data: value,
-        })
-        .into_response(),
+        Ok(value) => {
+            emit_account_event(&state.events, "status_refreshed", id);
+            Json(ApiResponse {
+                success: true,
+                data: value,
+            })
+            .into_response()
+        }
         Err(err) => error(StatusCode::BAD_REQUEST, &err.code, &err.message),
     }
 }
@@ -1220,6 +1738,9 @@ async fn accounts_refresh_credits_all(
     let mut results = Vec::new();
     for id in ids {
         let result = refresh_account_status(&state.db, id, false).await;
+        if result.is_ok() {
+            emit_account_event(&state.events, "status_refreshed", id);
+        }
         results.push(match result {
             Ok(value) => json!({ "id": id, "success": true, "data": value }),
             Err(err) => json!({ "id": id, "success": false, "error": { "type": err.code, "message": err.message } }),
@@ -1236,21 +1757,112 @@ async fn account_probe(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<i64>,
+    Json(payload): Json<AccountProbeRequest>,
 ) -> impl IntoResponse {
     if let Err(resp) = require_admin(&state.db, &headers).await {
         return resp;
     }
-    match refresh_account_status(&state.db, id, true).await {
-        Ok(value) => Json(ApiResponse {
-            success: true,
-            data: value,
-        })
-        .into_response(),
-        Err(err) => error(StatusCode::BAD_REQUEST, &err.code, &err.message),
+    let model = payload.model.trim().to_string();
+    let message = payload.message.trim().to_string();
+    if model.is_empty() || message.is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_probe",
+            "请选择模型并填写探测内容",
+        );
     }
+    if payload.save_defaults.unwrap_or(true) {
+        let _ = save_json_setting(&state.db, "account_probe_model", &json!(model)).await;
+        let _ = save_json_setting(&state.db, "account_probe_message", &json!(message)).await;
+    }
+    let row = match sqlx::query("SELECT * FROM accounts WHERE id=?")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "account_not_found", "账号不存在"),
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db_error",
+                &err.to_string(),
+            );
+        }
+    };
+    let Some(credentials) = account_credentials(&row) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "credential_missing",
+            "这个账号还没有可用凭据",
+        );
+    };
+    let email = row.get::<String, _>("email");
+    let account_id = row.get::<i64, _>("id");
+    let db = state.db.clone();
+    let events = state.events.clone();
+    let engine = state.engine.clone();
+    let engine_account = EngineAccount {
+        api_key: credentials.api_key,
+        jwt_token: credentials.jwt_token,
+        proxy_url: proxy_url_for_account(&state.db, account_id).await,
+    };
+    let engine_model = resolve_engine_model(&model);
+    let engine_messages = vec![EngineMessage {
+        role: "user".to_string(),
+        content: message,
+    }];
+    let s = stream! {
+        let start = json!({"type": "message_start", "accountId": account_id, "model": model, "email": email});
+        emit_admin_event(&events, "account_probe_started", start.clone());
+        yield Ok::<Event, std::convert::Infallible>(Event::default().data(start.to_string()));
+        match engine
+            .messages_stream(
+                None,
+                Some(format!("probe:{account_id}:{model}")),
+                engine_account,
+                engine_model,
+                engine_messages,
+            )
+            .await
+        {
+            Ok(upstream) => {
+                use futures_util::StreamExt;
+                futures_util::pin_mut!(upstream);
+                while let Some(item) = upstream.next().await {
+                    match item {
+                        Ok(chunk) => yield Ok(Event::default().data(json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": chunk.text}}).to_string())),
+                        Err(err) => {
+                            let message = err.to_string();
+                            if is_transient_probe_error(&message) {
+                                let _ = mark_account_transient_error_with_events(&db, &events, account_id, &message).await;
+                            } else {
+                                let _ = mark_account_error_with_events(&db, &events, account_id, &message).await;
+                            }
+                            yield Ok(Event::default().data(json!({"type":"error","error":{"type":"api_error","message":message}}).to_string()));
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if is_transient_probe_error(&message) {
+                    let _ = mark_account_transient_error_with_events(&db, &events, account_id, &message).await;
+                } else {
+                    let _ = mark_account_error_with_events(&db, &events, account_id, &message).await;
+                }
+                yield Ok(Event::default().data(json!({"type":"error","error":{"type":"api_error","message":message}}).to_string()));
+                return;
+            }
+        }
+        yield Ok(Event::default().data(json!({"type": "message_stop"}).to_string()));
+        let _ = mark_account_probe_success_with_events(&db, &events, account_id).await;
+    };
+    Sse::new(s).into_response()
 }
 
-async fn accounts_probe_all(
+async fn accounts_refresh_status_all(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
@@ -1269,7 +1881,10 @@ async fn accounts_probe_all(
     };
     let mut results = Vec::new();
     for id in ids {
-        let result = refresh_account_status(&state.db, id, true).await;
+        let result = refresh_account_status(&state.db, id, false).await;
+        if result.is_ok() {
+            emit_account_event(&state.events, "status_refreshed", id);
+        }
         results.push(match result {
             Ok(value) => json!({ "id": id, "success": true, "data": value }),
             Err(err) => json!({ "id": id, "success": false, "error": { "type": err.code, "message": err.message } }),
@@ -1278,6 +1893,27 @@ async fn accounts_probe_all(
     Json(ApiResponse {
         success: true,
         data: json!({ "results": results }),
+    })
+    .into_response()
+}
+
+async fn account_probe_defaults(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&state.db, &headers).await {
+        return resp;
+    }
+    let default_model = get_setting_string(&state.db, "account_probe_model")
+        .await
+        .unwrap_or_else(|| "claude-opus-4.7".to_string());
+    let default_message = get_setting_string(&state.db, "account_probe_message")
+        .await
+        .unwrap_or_else(|| "用一句话确认这个账号可以正常回复。".to_string());
+    let models = model_catalog(&state.db).await;
+    Json(ApiResponse {
+        success: true,
+        data: json!({ "model": default_model, "message": default_message, "models": models }),
     })
     .into_response()
 }
@@ -1381,9 +2017,15 @@ async fn login_jobs_create(
         return error(StatusCode::INTERNAL_SERVER_ERROR, "db_error", &err.to_string());
     }
     let db = state.db.clone();
+    let events = state.events.clone();
     let job_id = id.clone();
+    emit_admin_event(
+        &events,
+        "login_job_changed",
+        json!({ "jobId": id, "action": "created" }),
+    );
     tokio::spawn(async move {
-        run_login_job(db, job_id, lines, payload).await;
+        run_login_job(db, events, job_id, lines, payload).await;
     });
     Json(ApiResponse {
         success: true,
@@ -1495,6 +2137,7 @@ async fn login_job_cancel(
         .await;
     let _ = add_job_event(
         &state.db,
+        &state.events,
         &id,
         "cancelled",
         json!({"message": "任务已停止"}),
@@ -1505,6 +2148,180 @@ async fn login_job_cancel(
         data: json!({}),
     })
     .into_response()
+}
+
+async fn client_api_keys_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&state.db, &headers).await {
+        return resp;
+    }
+    let rows = match sqlx::query("SELECT * FROM client_api_keys ORDER BY created_at DESC")
+        .fetch_all(&state.db)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db_error",
+                &err.to_string(),
+            );
+        }
+    };
+    let keys: Vec<Value> = rows.into_iter().map(client_api_key_json).collect();
+    Json(ApiResponse {
+        success: true,
+        data: json!({ "keys": keys }),
+    })
+    .into_response()
+}
+
+async fn client_api_keys_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateClientApiKeyRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&state.db, &headers).await {
+        return resp;
+    }
+    let key = payload
+        .key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("wsk-{}", Uuid::new_v4().simple()));
+    let name = normalize_client_api_key_name(payload.name.as_deref());
+    let enabled = payload.enabled.unwrap_or(true);
+    let now_text = now();
+    match sqlx::query(
+        "INSERT INTO client_api_keys (name, key_value, key_hash, key_mask, enabled, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(name)
+    .bind(&key)
+    .bind(sha256_hex(&key))
+    .bind(mask_secret(&key))
+    .bind(if enabled { 1_i64 } else { 0_i64 })
+    .bind(&now_text)
+    .bind(&now_text)
+    .execute(&state.db)
+    .await
+    {
+        Ok(done) => Json(ApiResponse {
+            success: true,
+            data: json!({
+                "id": done.last_insert_rowid(),
+                "key": key
+            }),
+        })
+        .into_response(),
+        Err(err) => error(
+            StatusCode::BAD_REQUEST,
+            "client_api_key_exists",
+            &client_api_key_db_error_message(&err.to_string()),
+        ),
+    }
+}
+
+async fn client_api_keys_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(payload): Json<UpdateClientApiKeyRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&state.db, &headers).await {
+        return resp;
+    }
+    let row = match sqlx::query("SELECT * FROM client_api_keys WHERE id=?")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "调用密钥不存在"),
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db_error",
+                &err.to_string(),
+            );
+        }
+    };
+    let name = payload
+        .name
+        .as_deref()
+        .map(|value| normalize_client_api_key_name(Some(value)))
+        .unwrap_or_else(|| row.get::<String, _>("name"));
+    let enabled = payload
+        .enabled
+        .map(|value| if value { 1_i64 } else { 0_i64 })
+        .unwrap_or_else(|| row.get::<i64, _>("enabled"));
+    let existing_hash = row.get::<String, _>("key_hash");
+    let existing_mask = row.get::<String, _>("key_mask");
+    let existing_value = row.get::<Option<String>, _>("key_value");
+    let (key_value, key_hash, key_mask) = payload
+        .key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|key| (Some(key.to_string()), sha256_hex(key), mask_secret(key)))
+        .unwrap_or((existing_value, existing_hash, existing_mask));
+    let now_text = now();
+    match sqlx::query(
+        "UPDATE client_api_keys SET name=?, key_value=?, key_hash=?, key_mask=?, enabled=?, updated_at=? WHERE id=?",
+    )
+    .bind(name)
+    .bind(key_value)
+    .bind(key_hash)
+    .bind(key_mask)
+    .bind(enabled)
+    .bind(now_text)
+    .bind(id)
+    .execute(&state.db)
+    .await
+    {
+        Ok(done) if done.rows_affected() > 0 => Json(ApiResponse {
+            success: true,
+            data: json!({}),
+        })
+        .into_response(),
+        Ok(_) => error(StatusCode::NOT_FOUND, "not_found", "调用密钥不存在"),
+        Err(err) => error(
+            StatusCode::BAD_REQUEST,
+            "client_api_key_exists",
+            &client_api_key_db_error_message(&err.to_string()),
+        ),
+    }
+}
+
+async fn client_api_keys_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&state.db, &headers).await {
+        return resp;
+    }
+    match sqlx::query("DELETE FROM client_api_keys WHERE id=?")
+        .bind(id)
+        .execute(&state.db)
+        .await
+    {
+        Ok(done) if done.rows_affected() > 0 => Json(ApiResponse {
+            success: true,
+            data: json!({}),
+        })
+        .into_response(),
+        Ok(_) => error(StatusCode::NOT_FOUND, "not_found", "调用密钥不存在"),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "db_error",
+            &err.to_string(),
+        ),
+    }
 }
 
 async fn requests_list(
@@ -1628,201 +2445,6 @@ async fn capacity_put(
     }
 }
 
-async fn account_test_defaults(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(resp) = require_admin(&state.db, &headers).await {
-        return resp;
-    }
-    let default_model = get_setting_string(&state.db, "account_test_model")
-        .await
-        .unwrap_or_else(|| "claude-opus-4.7".to_string());
-    let default_message = get_setting_string(&state.db, "account_test_message")
-        .await
-        .unwrap_or_else(|| "用一句话确认这个账号可以正常回复。".to_string());
-    let models = model_catalog(&state.db).await;
-    Json(ApiResponse {
-        success: true,
-        data: json!({ "model": default_model, "message": default_message, "models": models }),
-    })
-    .into_response()
-}
-
-async fn account_test(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(payload): Json<AccountTestRequest>,
-) -> impl IntoResponse {
-    if let Err(resp) = require_admin(&state.db, &headers).await {
-        return resp;
-    }
-    let model = payload.model.trim().to_string();
-    let message = payload.message.trim().to_string();
-    if model.is_empty() || message.is_empty() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "invalid_test",
-            "请选择模型并填写测试内容",
-        );
-    }
-    if payload.save_defaults.unwrap_or(true) {
-        let _ = save_json_setting(&state.db, "account_test_model", &json!(model)).await;
-        let _ = save_json_setting(&state.db, "account_test_message", &json!(message)).await;
-    }
-    let capacity = capacity_settings(&state.db).await.unwrap_or_default();
-    let scheduler = AccountScheduler::new(state.db.clone(), capacity.clone());
-    let mut lease = match payload.account_id {
-        Some(id) => match scheduler
-            .try_reserve_account(id, &model, Some(format!("admin-test:{id}")), false)
-            .await
-        {
-            Ok(Some(lease)) => lease,
-            Ok(None) => {
-                return error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "account_unavailable",
-                    "这个账号暂时不可用",
-                );
-            }
-            Err(err) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "scheduler_error",
-                    &err.to_string(),
-                );
-            }
-        },
-        None => match scheduler
-            .acquire(&model, Some("admin-test:auto".to_string()))
-            .await
-        {
-            Ok(lease) => lease,
-            Err(AcquireError::TemporarilyUnavailable {
-                retry_after_secs,
-                reason,
-            }) => {
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [(header::RETRY_AFTER, HeaderValue::from_str(&retry_after_secs.to_string()).unwrap_or_else(|_| HeaderValue::from_static("60")))],
-                    Json(json!({ "error": { "type": "rate_limit_exceeded", "message": reason, "retry_after": retry_after_secs } })),
-                ).into_response();
-            }
-            Err(AcquireError::NoAccount) => {
-                return error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "pool_exhausted",
-                    "没有可用账号",
-                );
-            }
-            Err(AcquireError::Db(err)) => {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "scheduler_error",
-                    &err.to_string(),
-                );
-            }
-        },
-    };
-    let stream_requested = payload.stream.unwrap_or(true);
-    if stream_requested {
-        let db = state.db.clone();
-        let capacity_for_stream = capacity.clone();
-        let engine = state.engine.clone();
-        let engine_account = EngineAccount {
-            api_key: lease.api_key.clone(),
-            proxy_url: proxy_url_for_account(&state.db, lease.account_id).await,
-        };
-        let engine_model = resolve_engine_model(&model);
-        let engine_messages = vec![EngineMessage {
-            role: "user".to_string(),
-            content: message.clone(),
-        }];
-        let s = stream! {
-            let start = json!({"type": "message_start", "accountId": lease.account_id, "model": model, "email": lease.email});
-            yield Ok::<Event, std::convert::Infallible>(Event::default().data(start.to_string()));
-            match engine.cascade_stream(engine_account, engine_model, engine_messages).await {
-                Ok(upstream) => {
-                    use futures_util::StreamExt;
-                    futures_util::pin_mut!(upstream);
-                    while let Some(item) = upstream.next().await {
-                        match item {
-                            Ok(chunk) => yield Ok(Event::default().data(json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": chunk.text}}).to_string())),
-                            Err(err) => {
-                                let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone());
-                                let _ = scheduler.mark_error(&mut lease, &err.to_string()).await;
-                                yield Ok(Event::default().data(json!({"type":"error","error":{"type":"api_error","message":err.to_string()}}).to_string()));
-                                return;
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone());
-                    let _ = scheduler.mark_error(&mut lease, &err.to_string()).await;
-                    yield Ok(Event::default().data(json!({"type":"error","error":{"type":"api_error","message":err.to_string()}}).to_string()));
-                    return;
-                }
-            }
-            yield Ok(Event::default().data(json!({"type": "message_stop"}).to_string()));
-            let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone());
-            let _ = scheduler.mark_success(&mut lease).await;
-        };
-        Sse::new(s).into_response()
-    } else {
-        let account_id = lease.account_id;
-        let email = lease.email.clone();
-        let engine = state.engine.clone();
-        let engine_account = EngineAccount {
-            api_key: lease.api_key.clone(),
-            proxy_url: proxy_url_for_account(&state.db, lease.account_id).await,
-        };
-        let engine_model = resolve_engine_model(&model);
-        let engine_messages = vec![EngineMessage {
-            role: "user".to_string(),
-            content: message.clone(),
-        }];
-        let mut content = String::new();
-        match engine
-            .cascade_stream(engine_account, engine_model, engine_messages)
-            .await
-        {
-            Ok(upstream) => {
-                use futures_util::StreamExt;
-                futures_util::pin_mut!(upstream);
-                while let Some(item) = upstream.next().await {
-                    match item {
-                        Ok(chunk) => content.push_str(&chunk.text),
-                        Err(err) => {
-                            let _ = scheduler.mark_error(&mut lease, &err.to_string()).await;
-                            return error(
-                                StatusCode::BAD_GATEWAY,
-                                "upstream_error",
-                                &err.to_string(),
-                            );
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                let _ = scheduler.mark_error(&mut lease, &err.to_string()).await;
-                return error(StatusCode::BAD_GATEWAY, "upstream_error", &err.to_string());
-            }
-        }
-        let _ = scheduler.mark_success(&mut lease).await;
-        Json(ApiResponse {
-            success: true,
-            data: json!({
-                "accountId": account_id,
-                "email": email,
-                "model": model,
-                "content": content
-            }),
-        })
-        .into_response()
-    }
-}
-
 async fn settings_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(resp) = require_admin(&state.db, &headers).await {
         return resp;
@@ -1859,14 +2481,29 @@ async fn settings_put(
             if key == "admin_key_hash" {
                 continue;
             }
-            let _ = sqlx::query(
+            if key == "client_api_keys" {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "use_client_api_key_page",
+                    "请在调用密钥页面管理",
+                );
+            }
+            let stored_value = value.to_string();
+            if let Err(err) = sqlx::query(
                 "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
             )
             .bind(key)
-            .bind(value.to_string())
+            .bind(stored_value)
             .bind(&now_text)
             .execute(&state.db)
-            .await;
+            .await
+            {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "settings_save_failed",
+                    &err.to_string(),
+                );
+            }
         }
     }
     Json(ApiResponse {
@@ -2029,6 +2666,36 @@ fn messages_from_anthropic(value: &Value) -> Vec<EngineMessage> {
         .unwrap_or_default()
 }
 
+fn messages_from_request(payload: &MessagesRequest) -> Vec<EngineMessage> {
+    let mut messages = messages_from_anthropic(&payload.messages);
+    if let Some(system) = payload.system.as_ref() {
+        let content = anthropic_content_to_text(system);
+        if !content.trim().is_empty() {
+            merge_system_into_user_context(&mut messages, &content);
+        }
+    }
+    messages
+}
+
+fn merge_system_into_user_context(messages: &mut Vec<EngineMessage>, system: &str) {
+    let system = system.trim();
+    if system.is_empty() {
+        return;
+    }
+    let prefix = format!("System context:\n{system}\n\nUser request:\n");
+    if let Some(first_user) = messages.iter_mut().find(|message| message.role == "user") {
+        first_user.content = format!("{prefix}{}", first_user.content);
+    } else {
+        messages.insert(
+            0,
+            EngineMessage {
+                role: "user".to_string(),
+                content: prefix.trim_end().to_string(),
+            },
+        );
+    }
+}
+
 fn anthropic_content_to_text(value: &Value) -> String {
     if let Some(text) = value.as_str() {
         return text.to_string();
@@ -2052,27 +2719,81 @@ fn anthropic_content_to_text(value: &Value) -> String {
     }
 }
 
+fn estimate_input_tokens_from_messages(messages: &[EngineMessage]) -> u64 {
+    let text_len: usize = messages
+        .iter()
+        .map(|message| message.content.chars().count() + message.role.chars().count())
+        .sum();
+    ((text_len as f64 / 4.0).ceil() as u64).max(1)
+}
+
+fn message_debug_summary(payload: &MessagesRequest) -> MessageDebugSummary {
+    let engine_messages = messages_from_request(payload);
+    let roles = engine_messages
+        .iter()
+        .map(|message| message.role.clone())
+        .collect::<Vec<_>>();
+    let metadata_keys = payload
+        .metadata
+        .as_object()
+        .map(|items| items.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    MessageDebugSummary {
+        message_count: payload.messages.as_array().map(Vec::len).unwrap_or(0),
+        roles,
+        system_chars: payload
+            .system
+            .as_ref()
+            .map(anthropic_content_to_text)
+            .map(|text| text.chars().count())
+            .unwrap_or(0),
+        tool_count: payload
+            .tools
+            .as_ref()
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0),
+        has_tool_choice: payload.tool_choice.is_some(),
+        metadata_keys,
+        input_chars: engine_messages
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum(),
+    }
+}
+
+fn sanitized_message_request(payload: &MessagesRequest, summary: &MessageDebugSummary) -> Value {
+    json!({
+        "model": payload.model,
+        "stream": payload.stream.unwrap_or(false),
+        "maxTokens": payload.max_tokens,
+        "messageCount": summary.message_count,
+        "roles": summary.roles,
+        "systemChars": summary.system_chars,
+        "toolCount": summary.tool_count,
+        "hasToolChoice": summary.has_tool_choice,
+        "metadataKeys": summary.metadata_keys,
+        "inputChars": summary.input_chars
+    })
+}
+
 fn resolve_engine_model(model: &str) -> EngineModel {
     let key = model_alias(model);
-    let (enum_value, model_uid): (u64, Option<String>) = match key.as_str() {
-        "claude-4.1-opus" => (328, Some("MODEL_CLAUDE_4_1_OPUS".to_string())),
-        "claude-4.5-opus" => (391, Some("MODEL_CLAUDE_4_5_OPUS".to_string())),
-        "claude-4.5-sonnet" => (353, Some("MODEL_PRIVATE_2".to_string())),
-        "claude-sonnet-4.6" => (0, Some("claude-sonnet-4-6".to_string())),
-        "claude-opus-4.6" => (0, Some("claude-opus-4-6".to_string())),
-        "claude-opus-4-7-low" => (0, Some("claude-opus-4-7-low".to_string())),
-        "claude-opus-4-7-high" => (0, Some("claude-opus-4-7-high".to_string())),
-        "claude-opus-4-7-xhigh" => (0, Some("claude-opus-4-7-xhigh".to_string())),
-        "claude-opus-4-7-max" => (0, Some("claude-opus-4-7-max".to_string())),
-        "claude-opus-4-7-medium" => (0, Some("claude-opus-4-7-medium".to_string())),
-        "gemini-2.5-flash" => (312, Some("MODEL_GOOGLE_GEMINI_2_5_FLASH".to_string())),
-        other => (0, Some(other.to_string())),
+    let model_uid = match key.as_str() {
+        "claude-4.1-opus" => Some("MODEL_CLAUDE_4_1_OPUS".to_string()),
+        "claude-4.5-opus" => Some("MODEL_CLAUDE_4_5_OPUS".to_string()),
+        "claude-4.5-sonnet" => Some("MODEL_PRIVATE_2".to_string()),
+        "claude-sonnet-4.6" => Some("claude-sonnet-4-6".to_string()),
+        "claude-opus-4.6" => Some("claude-opus-4-6".to_string()),
+        "claude-opus-4-7-low" => Some("claude-opus-4-7-low".to_string()),
+        "claude-opus-4-7-high" => Some("claude-opus-4-7-high".to_string()),
+        "claude-opus-4-7-xhigh" => Some("claude-opus-4-7-xhigh".to_string()),
+        "claude-opus-4-7-max" => Some("claude-opus-4-7-max".to_string()),
+        "claude-opus-4-7-medium" => Some("claude-opus-4-7-medium".to_string()),
+        "gemini-2.5-flash" => Some("MODEL_GOOGLE_GEMINI_2_5_FLASH".to_string()),
+        other => Some(other.to_string()),
     };
-    EngineModel {
-        id: key,
-        enum_value,
-        model_uid,
-    }
+    EngineModel { id: key, model_uid }
 }
 
 fn model_alias(model: &str) -> String {
@@ -2086,7 +2807,7 @@ fn model_alias(model: &str) -> String {
         "claude-opus-4-6" | "claude-opus-4.6" => "claude-opus-4.6".to_string(),
         "claude-sonnet-4-6" | "claude-sonnet-4.6" => "claude-sonnet-4.6".to_string(),
         "claude-opus-4-7" | "claude-opus-4.7" | "claude-opus-4-7-latest" => {
-            "claude-opus-4-7-medium".to_string()
+            "claude-opus-4-7-low".to_string()
         }
         "claude-opus-4.7-low" => "claude-opus-4-7-low".to_string(),
         "claude-opus-4.7-high" => "claude-opus-4-7-high".to_string(),
@@ -2102,6 +2823,7 @@ async fn api_not_found() -> impl IntoResponse {
 
 async fn run_login_job(
     db: SqlitePool,
+    events: broadcast::Sender<AdminEvent>,
     job_id: String,
     lines: Vec<String>,
     opts: CreateLoginJobRequest,
@@ -2127,10 +2849,12 @@ async fn run_login_job(
                 .await;
                 let _ = add_job_event(
                     &db,
+                    &events,
                     &job_id,
                     "failed",
                     json!({
                         "index": index,
+                        "email": line,
                         "emailMasked": mask_email(line),
                         "errorCode": "ERR_FORMAT_INVALID",
                         "message": err,
@@ -2141,12 +2865,21 @@ async fn run_login_job(
                 continue;
             }
         };
+        let email = entry.email.clone();
         let email_masked = mask_email(&entry.email);
         let _ = add_job_event(
             &db,
+            &events,
             &job_id,
             "progress",
-            json!({"index": index, "total": lines.len(), "emailMasked": email_masked, "status": "running"}),
+            json!({
+                "index": index,
+                "total": lines.len(),
+                "email": email,
+                "emailMasked": email_masked,
+                "status": "running",
+                "message": "开始处理"
+            }),
         )
         .await;
 
@@ -2164,6 +2897,9 @@ async fn run_login_job(
         match result {
             Ok(login) => {
                 let account_id = upsert_logged_in_account(&db, &entry, login).await;
+                if let Some(id) = account_id {
+                    emit_account_event(&events, "imported", id);
+                }
                 let _ = clear_login_failures(&db, &entry.email).await;
                 let _ = sqlx::query(
                     "UPDATE login_jobs SET success_count=success_count+1, updated_at=? WHERE id=?",
@@ -2174,9 +2910,16 @@ async fn run_login_job(
                 .await;
                 let _ = add_job_event(
                     &db,
+                    &events,
                     &job_id,
                     "success",
-                    json!({"index": index, "emailMasked": email_masked, "accountId": account_id}),
+                    json!({
+                        "index": index,
+                        "email": entry.email,
+                        "emailMasked": email_masked,
+                        "accountId": account_id,
+                        "message": "账号已添加"
+                    }),
                 )
                 .await;
             }
@@ -2193,10 +2936,12 @@ async fn run_login_job(
                 .await;
                 let _ = add_job_event(
                     &db,
+                    &events,
                     &job_id,
                     "failed",
                     json!({
                         "index": index,
+                        "email": entry.email,
                         "emailMasked": email_masked,
                         "errorCode": err.code,
                         "message": err.message,
@@ -2215,9 +2960,14 @@ async fn run_login_job(
             };
             let _ = add_job_event(
                 &db,
+                &events,
                 &job_id,
                 "waiting",
-                json!({"seconds": wait, "reason": if success { "normal" } else { "failed" }}),
+                json!({
+                    "seconds": wait,
+                    "reason": if success { "normal" } else { "failed" },
+                    "message": if success { "等待后继续处理下一个账号" } else { "失败后等待，随后继续处理下一个账号" }
+                }),
             )
             .await;
             tokio::time::sleep(StdDuration::from_secs(wait)).await;
@@ -2249,9 +2999,14 @@ async fn run_login_job(
             .unwrap_or(0);
         let _ = add_job_event(
             &db,
+            &events,
             &job_id,
             "done",
-            json!({"successCount": success_count, "failedCount": failed_count}),
+            json!({
+                "successCount": success_count,
+                "failedCount": failed_count,
+                "message": "批量导入已完成"
+            }),
         )
         .await;
     }
@@ -2270,6 +3025,7 @@ async fn job_cancelled(db: &SqlitePool, job_id: &str) -> bool {
 
 async fn add_job_event(
     db: &SqlitePool,
+    events: &broadcast::Sender<AdminEvent>,
     job_id: &str,
     event_type: &str,
     payload: Value,
@@ -2281,6 +3037,11 @@ async fn add_job_event(
         .bind(now())
         .execute(db)
         .await?;
+    emit_admin_event(
+        events,
+        "login_job_changed",
+        json!({ "jobId": job_id, "eventType": event_type, "payload": payload }),
+    );
     Ok(())
 }
 
@@ -2605,8 +3366,12 @@ async fn account_ids(db: &SqlitePool) -> anyhow::Result<Vec<i64>> {
 }
 
 fn account_api_key(row: &sqlx::sqlite::SqliteRow) -> Option<String> {
+    account_credentials(row).map(|credentials| credentials.api_key)
+}
+
+fn account_credentials(row: &sqlx::sqlite::SqliteRow) -> Option<AccountCredentials> {
     let raw = row.get::<Option<String>, _>("credentials_json");
-    account_api_key_from_raw(raw.as_deref())
+    account_credentials_from_raw(raw.as_deref())
 }
 
 async fn refresh_account_status(
@@ -2704,9 +3469,246 @@ async fn mark_account_error(db: &SqlitePool, id: i64, message: &str) -> anyhow::
     Ok(())
 }
 
+async fn mark_account_error_with_events(
+    db: &SqlitePool,
+    events: &broadcast::Sender<AdminEvent>,
+    id: i64,
+    message: &str,
+) -> anyhow::Result<()> {
+    mark_account_error(db, id, message).await?;
+    emit_admin_event(
+        events,
+        "account_error",
+        json!({ "accountId": id, "message": message }),
+    );
+    Ok(())
+}
+
+async fn mark_account_transient_error(
+    db: &SqlitePool,
+    id: i64,
+    message: &str,
+) -> anyhow::Result<()> {
+    let now_text = now();
+    sqlx::query("UPDATE accounts SET last_error=?, updated_at=? WHERE id=?")
+        .bind(message.chars().take(200).collect::<String>())
+        .bind(now_text)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn mark_account_transient_error_with_events(
+    db: &SqlitePool,
+    events: &broadcast::Sender<AdminEvent>,
+    id: i64,
+    message: &str,
+) -> anyhow::Result<()> {
+    mark_account_transient_error(db, id, message).await?;
+    emit_admin_event(
+        events,
+        "account_transient_error",
+        json!({ "accountId": id, "message": message }),
+    );
+    Ok(())
+}
+
+async fn mark_account_probe_success(db: &SqlitePool, id: i64) -> anyhow::Result<()> {
+    let now_text = now();
+    sqlx::query("UPDATE accounts SET status='ready', error_count=0, last_error=NULL, last_probed_at=?, updated_at=? WHERE id=?")
+        .bind(&now_text)
+        .bind(&now_text)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn mark_account_probe_success_with_events(
+    db: &SqlitePool,
+    events: &broadcast::Sender<AdminEvent>,
+    id: i64,
+) -> anyhow::Result<()> {
+    mark_account_probe_success(db, id).await?;
+    emit_account_event(events, "probe_success", id);
+    Ok(())
+}
+
+fn is_transient_probe_error(message: &str) -> bool {
+    is_transient_upstream_error(message)
+}
+
+fn is_transient_upstream_error(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    text.contains("transport")
+        || text.contains("econnreset")
+        || text.contains("stream")
+        || text.contains("timeout")
+        || text.contains("timed out")
+        || text.contains("connection")
+        || text.contains("rate limit")
+        || text.contains("rate_limit")
+        || text.contains("global rate limit")
+        || text.contains("provider")
+        || text.contains("temporarily")
+        || text.contains("超时")
+}
+
+fn classify_upstream_rate_limit(
+    message: &str,
+    capacity: &CapacitySettings,
+) -> Option<UpstreamRateLimit> {
+    let text = message.to_ascii_lowercase();
+    let retry_after_secs = parse_retry_after_secs(message);
+    if text.contains("reached message rate limit for this model")
+        || text.contains("message rate limit for this model")
+    {
+        return Some(UpstreamRateLimit {
+            scope: UpstreamRateLimitScope::Model,
+            retry_after_secs: retry_after_secs.unwrap_or(capacity.model_cooldown_secs),
+        });
+    }
+    if text.contains("global rate limit")
+        || text.contains("over their global rate limit")
+        || text.contains("rate_limit")
+        || text.contains("rate limit")
+    {
+        return Some(UpstreamRateLimit {
+            scope: UpstreamRateLimitScope::Account,
+            retry_after_secs: retry_after_secs.unwrap_or(capacity.suspicious_cooldown_secs),
+        });
+    }
+    None
+}
+
+fn is_upstream_rate_limit_error(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    text.contains("rate limit") || text.contains("rate_limit") || text.contains("global rate limit")
+}
+
+fn parse_retry_after_secs(text: &str) -> Option<i64> {
+    let text = text.to_ascii_lowercase();
+    let markers = ["resets in:", "reset in:", "retry after:", "retry-after:"];
+    let source = if let Some(rest) = markers
+        .iter()
+        .find_map(|marker| text.split_once(marker).map(|(_, rest)| rest.trim()))
+    {
+        let token: String = rest
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric())
+            .collect();
+        if token.is_empty() {
+            return None;
+        }
+        token
+    } else {
+        text.to_string()
+    };
+    let mut total = 0_i64;
+    let mut number = String::new();
+    let mut saw_unit = false;
+    for ch in source.chars().take(80) {
+        if ch.is_ascii_digit() {
+            number.push(ch);
+            continue;
+        }
+        if number.is_empty() {
+            if saw_unit && matches!(ch, '.' | ',' | ';' | '}' | ']') {
+                break;
+            }
+            continue;
+        }
+        let value = number.parse::<i64>().ok()?;
+        number.clear();
+        match ch {
+            'd' => {
+                total += value * 24 * 60 * 60;
+                saw_unit = true;
+            }
+            'h' => {
+                total += value * 60 * 60;
+                saw_unit = true;
+            }
+            'm' => {
+                total += value * 60;
+                saw_unit = true;
+            }
+            's' => {
+                total += value;
+                saw_unit = true;
+            }
+            _ if !saw_unit => return Some(value.max(1)),
+            _ => {}
+        }
+    }
+    if saw_unit {
+        Some(total.max(1))
+    } else if !number.is_empty() {
+        number.parse::<i64>().ok().map(|value| value.max(1))
+    } else {
+        None
+    }
+}
+
+fn anthropic_error_type_for_upstream(message: &str) -> &'static str {
+    if is_upstream_rate_limit_error(message) {
+        "rate_limit_error"
+    } else {
+        "api_error"
+    }
+}
+
+fn upstream_retry_after_secs(message: &str) -> i64 {
+    parse_retry_after_secs(message).unwrap_or(60)
+}
+
+fn rate_limit_probe_after(retry_after_secs: i64) -> String {
+    let delay = retry_after_secs.min(RATE_LIMIT_PROBE_INTERVAL_SECS).max(1);
+    (Utc::now() + Duration::seconds(delay)).to_rfc3339()
+}
+
+fn next_rate_limit_probe_after() -> String {
+    (Utc::now() + Duration::seconds(RATE_LIMIT_PROBE_INTERVAL_SECS)).to_rfc3339()
+}
+
+fn rate_limited_response(message: &str, retry_after_secs: i64) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(
+            header::RETRY_AFTER,
+            HeaderValue::from_str(&retry_after_secs.to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("60")),
+        )],
+        Json(ApiError {
+            error: ErrorBody {
+                kind: "rate_limit_error".to_string(),
+                message: message.to_string(),
+            },
+        }),
+    )
+        .into_response()
+}
+
+fn upstream_messages_error_response(message: &str) -> Response {
+    if is_upstream_rate_limit_error(message) {
+        rate_limited_response(message, upstream_retry_after_secs(message))
+    } else {
+        error(StatusCode::BAD_GATEWAY, "upstream_error", message)
+    }
+}
+
 impl AccountScheduler {
-    fn new(db: SqlitePool, capacity: CapacitySettings) -> Self {
-        Self { db, capacity }
+    fn new(
+        db: SqlitePool,
+        capacity: CapacitySettings,
+        events: broadcast::Sender<AdminEvent>,
+    ) -> Self {
+        Self {
+            db,
+            capacity,
+            events,
+        }
     }
 
     async fn acquire(
@@ -2720,6 +3722,7 @@ impl AccountScheduler {
             return Err(AcquireError::TemporarilyUnavailable {
                 retry_after_secs: self.capacity.queue_timeout_secs.clamp(1, 300),
                 reason: "全局执行槽已满".to_string(),
+                upstream_error: None,
             });
         }
         let model_used = self.model_inflight(model).await.map_err(AcquireError::Db)?;
@@ -2727,6 +3730,7 @@ impl AccountScheduler {
             return Err(AcquireError::TemporarilyUnavailable {
                 retry_after_secs: 30,
                 reason: "当前模型执行槽已满".to_string(),
+                upstream_error: None,
             });
         }
         if let Some(caller) = caller_key.as_deref() {
@@ -2755,9 +3759,10 @@ impl AccountScheduler {
             .await
             .map_err(|err| AcquireError::Db(err.into()))?;
         let mut candidates = Vec::new();
-        let mut retry_after_secs = 60_i64;
+        let mut retry_after_secs = i64::MAX;
+        let mut upstream_error: Option<String> = None;
         for row in rows {
-            let account = scheduler_account_from_row(row);
+            let account = scheduler_account_from_row(&row);
             let availability = self
                 .availability(&account, model)
                 .await
@@ -2766,13 +3771,21 @@ impl AccountScheduler {
                 candidates.push((account, availability.rpm_used));
             } else if availability.retry_after_secs > 0 {
                 retry_after_secs = retry_after_secs.min(availability.retry_after_secs);
+                if upstream_error.is_none() {
+                    upstream_error = availability.upstream_error;
+                }
             }
         }
 
         if candidates.is_empty() {
             return Err(AcquireError::TemporarilyUnavailable {
-                retry_after_secs: retry_after_secs.max(1),
+                retry_after_secs: if retry_after_secs == i64::MAX {
+                    60
+                } else {
+                    retry_after_secs.max(1)
+                },
                 reason: "所有账号都不可用或已达到限制".to_string(),
+                upstream_error,
             });
         }
 
@@ -2792,7 +3805,7 @@ impl AccountScheduler {
 
         for (account, _) in candidates {
             if let Some(lease) = self
-                .try_reserve_loaded_account(account, model, caller_key.clone(), false)
+                .reserve_loaded_account(account, model, caller_key.clone(), false)
                 .await
                 .map_err(AcquireError::Db)?
             {
@@ -2803,6 +3816,7 @@ impl AccountScheduler {
         Err(AcquireError::TemporarilyUnavailable {
             retry_after_secs: 5,
             reason: "账号并发槽位已满".to_string(),
+            upstream_error: None,
         })
     }
 
@@ -2812,22 +3826,59 @@ impl AccountScheduler {
                 .await?;
         }
         let now_text = now();
-        sqlx::query("UPDATE accounts SET error_count=0, last_error=NULL, last_used_at=?, updated_at=? WHERE id=?")
+        sqlx::query("UPDATE accounts SET status='ready', error_count=0, last_error=NULL, last_used_at=?, rate_limited_until=NULL, rate_limit_probe_after=NULL, updated_at=? WHERE id=?")
             .bind(&now_text)
             .bind(&now_text)
             .bind(lease.account_id)
             .execute(&self.db)
             .await?;
+        sqlx::query("DELETE FROM account_model_rate_limits WHERE account_id=? AND model=?")
+            .bind(lease.account_id)
+            .bind(&lease.model)
+            .execute(&self.db)
+            .await?;
+        emit_admin_event(
+            &self.events,
+            "account_request_succeeded",
+            json!({
+                "accountId": lease.account_id,
+                "email": lease.email,
+                "model": lease.model
+            }),
+        );
         self.release(lease).await
     }
 
     #[allow(dead_code)]
     async fn mark_error(&self, lease: &mut AccountLease, message: &str) -> anyhow::Result<()> {
-        mark_account_error(&self.db, lease.account_id, message).await?;
+        mark_account_error_with_events(&self.db, &self.events, lease.account_id, message).await?;
         self.release(lease).await
     }
 
-    #[allow(dead_code)]
+    async fn mark_failure(&self, lease: &mut AccountLease, message: &str) -> anyhow::Result<()> {
+        if let Some(limit) = classify_upstream_rate_limit(message, &self.capacity) {
+            let model = match limit.scope {
+                UpstreamRateLimitScope::Model => Some(lease.model.clone()),
+                UpstreamRateLimitScope::Account => None,
+            };
+            self.mark_rate_limited(lease, model.as_deref(), limit.retry_after_secs, message)
+                .await?;
+            return Ok(());
+        }
+        if is_transient_upstream_error(message) {
+            mark_account_transient_error_with_events(
+                &self.db,
+                &self.events,
+                lease.account_id,
+                message,
+            )
+            .await?;
+            self.release(lease).await
+        } else {
+            self.mark_error(lease, message).await
+        }
+    }
+
     async fn mark_rate_limited(
         &self,
         lease: &mut AccountLease,
@@ -2836,25 +3887,28 @@ impl AccountScheduler {
         reason: &str,
     ) -> anyhow::Result<()> {
         let limited_until = (Utc::now() + Duration::seconds(retry_after_secs.max(1))).to_rfc3339();
+        let probe_after = rate_limit_probe_after(retry_after_secs.max(1));
         let now_text = now();
         if let Some(model) = model {
             sqlx::query(
-                "INSERT INTO account_model_rate_limits (account_id, model, limited_until, reason, updated_at)
-                 VALUES (?, ?, ?, ?, ?)
-                 ON CONFLICT(account_id, model) DO UPDATE SET limited_until=excluded.limited_until, reason=excluded.reason, updated_at=excluded.updated_at",
+                "INSERT INTO account_model_rate_limits (account_id, model, limited_until, reason, probe_after, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(account_id, model) DO UPDATE SET limited_until=excluded.limited_until, reason=excluded.reason, probe_after=excluded.probe_after, updated_at=excluded.updated_at",
             )
             .bind(lease.account_id)
             .bind(model)
             .bind(&limited_until)
             .bind(reason)
+            .bind(&probe_after)
             .bind(&now_text)
             .execute(&self.db)
             .await?;
         } else {
             sqlx::query(
-                "UPDATE accounts SET rate_limited_until=?, last_error=?, updated_at=? WHERE id=?",
+                "UPDATE accounts SET rate_limited_until=?, rate_limit_probe_after=?, last_error=?, updated_at=? WHERE id=?",
             )
             .bind(&limited_until)
+            .bind(&probe_after)
             .bind(reason)
             .bind(&now_text)
             .bind(lease.account_id)
@@ -2864,6 +3918,19 @@ impl AccountScheduler {
         if let Some(caller) = lease.caller_key.as_deref() {
             self.clear_sticky(caller, &lease.model).await?;
         }
+        emit_admin_event(
+            &self.events,
+            "account_rate_limited",
+            json!({
+                "accountId": lease.account_id,
+                "email": lease.email,
+                "model": model,
+                "requestedModel": lease.model,
+                "limitedUntil": limited_until,
+                "probeAfter": probe_after,
+                "message": reason
+            }),
+        );
         self.release(lease).await
     }
 
@@ -2881,6 +3948,15 @@ impl AccountScheduler {
             .execute(&self.db)
             .await?;
         lease.released = true;
+        emit_admin_event(
+            &self.events,
+            "account_request_finished",
+            json!({
+                "accountId": lease.account_id,
+                "email": lease.email,
+                "model": lease.model
+            }),
+        );
         Ok(())
     }
 
@@ -2898,7 +3974,7 @@ impl AccountScheduler {
     }
 
     async fn clear_rate_limit(&self, account_id: i64) -> anyhow::Result<()> {
-        sqlx::query("UPDATE accounts SET rate_limited_until=NULL, updated_at=? WHERE id=?")
+        sqlx::query("UPDATE accounts SET rate_limited_until=NULL, rate_limit_probe_after=NULL, updated_at=? WHERE id=?")
             .bind(now())
             .bind(account_id)
             .execute(&self.db)
@@ -2907,6 +3983,7 @@ impl AccountScheduler {
             .bind(account_id)
             .execute(&self.db)
             .await?;
+        emit_account_event(&self.events, "clear_rate_limit", account_id);
         Ok(())
     }
 
@@ -2915,6 +3992,7 @@ impl AccountScheduler {
             .bind(account_id)
             .execute(&self.db)
             .await?;
+        emit_account_event(&self.events, "clear_sticky", account_id);
         Ok(())
     }
 
@@ -2947,7 +4025,7 @@ impl AccountScheduler {
         else {
             return Ok(None);
         };
-        self.try_reserve_loaded_account(scheduler_account_from_row(row), model, caller_key, sticky)
+        self.try_reserve_loaded_account(scheduler_account_from_row(&row), model, caller_key, sticky)
             .await
     }
 
@@ -2961,6 +4039,17 @@ impl AccountScheduler {
         if !self.availability(&account, model).await?.available {
             return Ok(None);
         }
+        self.reserve_loaded_account(account, model, caller_key, sticky)
+            .await
+    }
+
+    async fn reserve_loaded_account(
+        &self,
+        account: SchedulerAccount,
+        model: &str,
+        caller_key: Option<String>,
+        sticky: bool,
+    ) -> anyhow::Result<Option<AccountLease>> {
         let account_limit = if account.max_concurrent > 0 {
             account
                 .max_concurrent
@@ -2997,12 +4086,13 @@ impl AccountScheduler {
             .bind(now())
             .execute(&self.db)
             .await?;
-        let api_key = account_api_key_from_raw(account.credentials_json.as_deref())
+        let credentials = account_credentials_from_raw(account.credentials_json.as_deref())
             .ok_or_else(|| anyhow::anyhow!("账号没有可用凭据"))?;
         Ok(Some(AccountLease {
             account_id: account.id,
             email: account.email,
-            api_key,
+            api_key: credentials.api_key,
+            jwt_token: credentials.jwt_token,
             reservation_id,
             sticky,
             caller_key,
@@ -3016,10 +4106,21 @@ impl AccountScheduler {
         account: &SchedulerAccount,
         model: &str,
     ) -> anyhow::Result<AccountAvailability> {
-        let now_utc = Utc::now();
         if !["ready", "active", "ok"].contains(&account.status.as_str()) {
-            return Ok(AccountAvailability::unavailable("status", 60));
+            return Ok(AccountAvailability::unavailable(
+                availability_kind_for_status(&account.status),
+                60,
+            ));
         }
+        self.availability_without_status(account, model).await
+    }
+
+    async fn availability_without_status(
+        &self,
+        account: &SchedulerAccount,
+        model: &str,
+    ) -> anyhow::Result<AccountAvailability> {
+        let now_utc = Utc::now();
         let account_limit = if account.max_concurrent > 0 {
             account
                 .max_concurrent
@@ -3028,35 +4129,67 @@ impl AccountScheduler {
             self.capacity.account_concurrency.max(1)
         };
         if account.current_concurrent >= account_limit {
-            return Ok(AccountAvailability::unavailable("concurrency_full", 5));
-        }
-        if date_in_future(account.rate_limited_until.as_deref(), now_utc) {
             return Ok(AccountAvailability::unavailable(
-                "rate_limited",
-                retry_after(account.rate_limited_until.as_deref(), 60),
+                AvailabilityKind::ConcurrencyFull,
+                5,
             ));
         }
-        if self.model_limited(account.id, model).await? {
-            return Ok(AccountAvailability::unavailable("model_rate_limited", 60));
+        if date_in_future(account.rate_limited_until.as_deref(), now_utc) {
+            let retry_after_secs = retry_after(account.rate_limited_until.as_deref(), 60);
+            if self
+                .claim_account_rate_limit_probe(
+                    account.id,
+                    account.rate_limit_probe_after.as_deref(),
+                )
+                .await?
+            {
+                return self.available_for_probe(account.id).await;
+            }
+            return Ok(AccountAvailability::unavailable_with_upstream(
+                AvailabilityKind::AccountRateLimited,
+                retry_after_secs,
+                self.account_last_error(account.id).await?,
+            ));
+        }
+        if let Some(limit) = self.model_rate_limit(account.id, model).await? {
+            if self
+                .claim_model_rate_limit_probe(account.id, model, limit.probe_after.as_deref())
+                .await?
+            {
+                return self.available_for_probe(account.id).await;
+            }
+            return Ok(AccountAvailability::unavailable_with_upstream(
+                AvailabilityKind::ModelRateLimited,
+                retry_after(Some(&limit.limited_until), 60),
+                limit.reason,
+            ));
         }
         if account.rpm_limit <= 0 || account.tier == "expired" {
-            return Ok(AccountAvailability::unavailable("tier_expired", 60));
+            return Ok(AccountAvailability::unavailable(
+                AvailabilityKind::TierExpired,
+                60,
+            ));
         }
         if model_blocked(account.blocked_models_json.as_deref(), model) {
-            return Ok(AccountAvailability::unavailable("model_blocked", 60));
+            return Ok(AccountAvailability::unavailable(
+                AvailabilityKind::ModelBlocked,
+                60,
+            ));
         }
         let used = self.rpm_used(account.id).await?;
         if used >= account.rpm_limit {
-            return Ok(AccountAvailability::unavailable("rpm_full", 60));
+            return Ok(AccountAvailability::unavailable(
+                AvailabilityKind::RpmFull,
+                60,
+            ));
         }
         if account_api_key_from_raw(account.credentials_json.as_deref()).is_none() {
-            return Ok(AccountAvailability::unavailable("credential_missing", 60));
+            return Ok(AccountAvailability::unavailable(
+                AvailabilityKind::CredentialMissing,
+                60,
+            ));
         }
-        Ok(AccountAvailability {
-            available: true,
-            retry_after_secs: 0,
-            rpm_used: used,
-        })
+        Ok(AccountAvailability::available(used))
     }
 
     async fn rpm_used(&self, account_id: i64) -> anyhow::Result<i64> {
@@ -3073,22 +4206,92 @@ impl AccountScheduler {
         Ok(row.get::<i64, _>("count"))
     }
 
-    async fn model_limited(&self, account_id: i64, model: &str) -> anyhow::Result<bool> {
+    async fn model_rate_limit(
+        &self,
+        account_id: i64,
+        model: &str,
+    ) -> anyhow::Result<Option<ModelRateLimit>> {
         let now_text = now();
         sqlx::query("DELETE FROM account_model_rate_limits WHERE limited_until <= ?")
             .bind(&now_text)
             .execute(&self.db)
             .await?;
         let row = sqlx::query(
-            "SELECT limited_until FROM account_model_rate_limits WHERE account_id=? AND model=?",
+            "SELECT limited_until, reason, probe_after FROM account_model_rate_limits WHERE account_id=? AND model=?",
         )
         .bind(account_id)
         .bind(model)
         .fetch_optional(&self.db)
         .await?;
-        Ok(row
-            .and_then(|row| row.get::<Option<String>, _>("limited_until"))
-            .is_some_and(|value| date_in_future(Some(&value), Utc::now())))
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let limited_until = row.get::<String, _>("limited_until");
+        if !date_in_future(Some(&limited_until), Utc::now()) {
+            return Ok(None);
+        }
+        Ok(Some(ModelRateLimit {
+            limited_until,
+            reason: row.get::<Option<String>, _>("reason"),
+            probe_after: row.get::<Option<String>, _>("probe_after"),
+        }))
+    }
+
+    async fn account_last_error(&self, account_id: i64) -> anyhow::Result<Option<String>> {
+        let row = sqlx::query("SELECT last_error FROM accounts WHERE id=?")
+            .bind(account_id)
+            .fetch_optional(&self.db)
+            .await?;
+        Ok(row.and_then(|row| row.get::<Option<String>, _>("last_error")))
+    }
+
+    async fn available_for_probe(&self, account_id: i64) -> anyhow::Result<AccountAvailability> {
+        let used = self.rpm_used(account_id).await?;
+        Ok(AccountAvailability::probing(used))
+    }
+
+    async fn claim_account_rate_limit_probe(
+        &self,
+        account_id: i64,
+        probe_after: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        if date_in_future(probe_after, Utc::now()) {
+            return Ok(false);
+        }
+        let next_probe = next_rate_limit_probe_after();
+        let updated = sqlx::query(
+            "UPDATE accounts SET rate_limit_probe_after=?, updated_at=? WHERE id=? AND (rate_limit_probe_after IS NULL OR rate_limit_probe_after <= ?)",
+        )
+        .bind(&next_probe)
+        .bind(now())
+        .bind(account_id)
+        .bind(now())
+        .execute(&self.db)
+        .await?;
+        Ok(updated.rows_affected() > 0)
+    }
+
+    async fn claim_model_rate_limit_probe(
+        &self,
+        account_id: i64,
+        model: &str,
+        probe_after: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        if date_in_future(probe_after, Utc::now()) {
+            return Ok(false);
+        }
+        let next_probe = next_rate_limit_probe_after();
+        let updated = sqlx::query(
+            "UPDATE account_model_rate_limits SET probe_after=?, updated_at=? WHERE account_id=? AND model=? AND (probe_after IS NULL OR probe_after <= ?)",
+        )
+        .bind(&next_probe)
+        .bind(now())
+        .bind(account_id)
+        .bind(model)
+        .bind(now())
+        .execute(&self.db)
+        .await?;
+        Ok(updated.rows_affected() > 0)
     }
 
     async fn sticky_account(&self, caller_key: &str, model: &str) -> anyhow::Result<Option<i64>> {
@@ -3168,23 +4371,77 @@ impl AccountScheduler {
 }
 
 #[derive(Debug)]
+struct ModelRateLimit {
+    limited_until: String,
+    reason: Option<String>,
+    probe_after: Option<String>,
+}
+
+#[derive(Debug)]
 struct AccountAvailability {
     available: bool,
+    kind: AvailabilityKind,
     retry_after_secs: i64,
     rpm_used: i64,
+    upstream_error: Option<String>,
 }
 
 impl AccountAvailability {
-    fn unavailable(_reason: &str, retry_after_secs: i64) -> Self {
+    fn available(rpm_used: i64) -> Self {
+        Self {
+            available: true,
+            kind: AvailabilityKind::Available,
+            retry_after_secs: 0,
+            rpm_used,
+            upstream_error: None,
+        }
+    }
+
+    fn probing(rpm_used: i64) -> Self {
+        Self {
+            available: true,
+            kind: AvailabilityKind::Probing,
+            retry_after_secs: 0,
+            rpm_used,
+            upstream_error: None,
+        }
+    }
+
+    fn unavailable(kind: AvailabilityKind, retry_after_secs: i64) -> Self {
         Self {
             available: false,
+            kind,
             retry_after_secs,
             rpm_used: 0,
+            upstream_error: None,
+        }
+    }
+
+    fn unavailable_with_upstream(
+        kind: AvailabilityKind,
+        retry_after_secs: i64,
+        upstream_error: Option<String>,
+    ) -> Self {
+        Self {
+            available: false,
+            kind,
+            retry_after_secs,
+            rpm_used: 0,
+            upstream_error,
         }
     }
 }
 
-fn scheduler_account_from_row(row: sqlx::sqlite::SqliteRow) -> SchedulerAccount {
+fn availability_kind_for_status(status: &str) -> AvailabilityKind {
+    match status {
+        "error" => AvailabilityKind::StatusError,
+        "disabled" => AvailabilityKind::StatusDisabled,
+        "banned" => AvailabilityKind::StatusBanned,
+        _ => AvailabilityKind::StatusUnavailable,
+    }
+}
+
+fn scheduler_account_from_row(row: &sqlx::sqlite::SqliteRow) -> SchedulerAccount {
     SchedulerAccount {
         id: row.get::<i64, _>("id"),
         email: row.get::<String, _>("email"),
@@ -3194,6 +4451,7 @@ fn scheduler_account_from_row(row: sqlx::sqlite::SqliteRow) -> SchedulerAccount 
         current_concurrent: row.get::<i64, _>("current_concurrent"),
         last_used_at: row.get::<Option<String>, _>("last_used_at"),
         rate_limited_until: row.get::<Option<String>, _>("rate_limited_until"),
+        rate_limit_probe_after: row.get::<Option<String>, _>("rate_limit_probe_after"),
         rpm_limit: row.get::<i64, _>("rpm_limit"),
         credits_json: row.get::<Option<String>, _>("credits_json"),
         blocked_models_json: row.get::<Option<String>, _>("blocked_models_json"),
@@ -3202,13 +4460,26 @@ fn scheduler_account_from_row(row: sqlx::sqlite::SqliteRow) -> SchedulerAccount 
 }
 
 fn account_api_key_from_raw(raw: Option<&str>) -> Option<String> {
+    account_credentials_from_raw(raw).map(|credentials| credentials.api_key)
+}
+
+fn account_credentials_from_raw(raw: Option<&str>) -> Option<AccountCredentials> {
     let value = serde_json::from_str::<Value>(raw?).ok()?;
-    value
+    let api_key = value
         .get("apiKey")
         .or_else(|| value.pointer("/extra/apiKey"))
         .or_else(|| value.get("sessionToken"))
         .and_then(Value::as_str)
+        .map(str::to_string)?;
+    let jwt_token = value
+        .get("jwt")
+        .or_else(|| value.get("jwtToken"))
+        .or_else(|| value.pointer("/extra/jwt"))
+        .or_else(|| value.pointer("/extra/jwtToken"))
+        .and_then(Value::as_str)
         .map(str::to_string)
+        .filter(|value| !value.trim().is_empty());
+    Some(AccountCredentials { api_key, jwt_token })
 }
 
 fn date_in_future(value: Option<&str>, now_utc: chrono::DateTime<Utc>) -> bool {
@@ -3284,6 +4555,7 @@ fn extract_caller_key(headers: &HeaderMap, payload: &Value) -> Option<String> {
     }
     for (name, prefix) in [
         ("x-session-id", "header"),
+        ("x-claude-code-session-id", "claude"),
         ("session_id", "codex"),
         ("x-amp-thread-id", "amp"),
         ("x-client-request-id", "clientreq"),
@@ -3341,7 +4613,7 @@ async fn refresh_rpm_counters(db: &SqlitePool) -> anyhow::Result<()> {
 
 async fn account_model_rate_limits(db: &SqlitePool) -> anyhow::Result<HashMap<i64, Value>> {
     let now_text = now();
-    let rows = sqlx::query("SELECT account_id, model, limited_until, reason FROM account_model_rate_limits WHERE limited_until > ?")
+    let rows = sqlx::query("SELECT account_id, model, limited_until, reason, probe_after FROM account_model_rate_limits WHERE limited_until > ?")
         .bind(now_text)
         .fetch_all(db)
         .await?;
@@ -3353,7 +4625,8 @@ async fn account_model_rate_limits(db: &SqlitePool) -> anyhow::Result<HashMap<i6
             model,
             json!({
                 "limitedUntil": row.get::<String, _>("limited_until"),
-                "reason": row.get::<Option<String>, _>("reason")
+                "reason": row.get::<Option<String>, _>("reason"),
+                "probeAfter": row.get::<Option<String>, _>("probe_after")
             }),
         );
     }
@@ -4057,12 +5330,202 @@ async fn require_admin(db: &SqlitePool, headers: &HeaderMap) -> Result<(), Respo
     }
 }
 
+async fn require_client_api_key(
+    db: &SqlitePool,
+    headers: &HeaderMap,
+    query: Option<&HashMap<String, String>>,
+) -> Result<(), Response> {
+    if !client_api_keys_required(db).await.map_err(|err| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_key_config_error",
+            &err.to_string(),
+        )
+    })? {
+        return Err(error(
+            StatusCode::UNAUTHORIZED,
+            "client_api_key_required",
+            "请先在管理台创建并启用调用密钥",
+        ));
+    }
+    let candidates = client_api_key_candidates(headers, query);
+    if candidates.is_empty() {
+        return Err(error(
+            StatusCode::UNAUTHORIZED,
+            "no_credentials",
+            "缺少调用密钥",
+        ));
+    }
+    if let Some(key_id) = find_active_client_api_key(db, &candidates)
+        .await
+        .map_err(|err| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_key_check_error",
+                &err.to_string(),
+            )
+        })?
+    {
+        let _ = touch_client_api_key(db, key_id).await;
+        return Ok(());
+    }
+    Err(error(
+        StatusCode::UNAUTHORIZED,
+        "invalid_credential",
+        "调用密钥不正确",
+    ))
+}
+
+async fn client_api_keys_required(db: &SqlitePool) -> anyhow::Result<bool> {
+    let row = sqlx::query("SELECT id FROM client_api_keys WHERE enabled=1 LIMIT 1")
+        .fetch_optional(db)
+        .await?;
+    Ok(row.is_some())
+}
+
+async fn find_active_client_api_key(
+    db: &SqlitePool,
+    candidates: &[String],
+) -> anyhow::Result<Option<i64>> {
+    for candidate in candidates {
+        let row =
+            sqlx::query("SELECT id FROM client_api_keys WHERE enabled=1 AND key_hash=? LIMIT 1")
+                .bind(sha256_hex(candidate))
+                .fetch_optional(db)
+                .await?;
+        if let Some(row) = row {
+            return Ok(Some(row.get::<i64, _>("id")));
+        }
+    }
+    Ok(None)
+}
+
+async fn touch_client_api_key(db: &SqlitePool, id: i64) -> anyhow::Result<()> {
+    sqlx::query("UPDATE client_api_keys SET last_used_at=? WHERE id=?")
+        .bind(now())
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+async fn client_api_keys_from_settings(db: &SqlitePool) -> anyhow::Result<Vec<String>> {
+    let Some(row) = sqlx::query("SELECT value FROM settings WHERE key='client_api_keys'")
+        .fetch_optional(db)
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let raw = row.get::<String, _>("value");
+    if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+        return Ok(normalize_api_keys_setting(&value));
+    }
+    Ok(normalize_api_keys_text(&raw))
+}
+
+fn client_api_key_candidates(
+    headers: &HeaderMap,
+    query: Option<&HashMap<String, String>>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(token) = bearer_token(headers) {
+        candidates.push(token);
+    }
+    for name in ["x-api-key", "x-goog-api-key"] {
+        if let Some(value) = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            candidates.push(value.to_string());
+        }
+    }
+    if let Some(query) = query {
+        for name in ["key", "auth_token"] {
+            if let Some(value) = query
+                .get(name)
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                candidates.push(value.to_string());
+            }
+        }
+    }
+    candidates
+}
+
+fn normalize_api_keys_setting(value: &Value) -> Vec<String> {
+    if let Some(items) = value.as_array() {
+        let joined = items
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        return normalize_api_keys_text(&joined);
+    }
+    value
+        .as_str()
+        .map(normalize_api_keys_text)
+        .unwrap_or_default()
+}
+
+fn normalize_api_keys_text(value: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for item in value.split(|ch: char| ch == '\n' || ch == '\r' || ch == ',' || ch == ';') {
+        let key = item.trim();
+        if !key.is_empty() && !keys.iter().any(|existing| existing == key) {
+            keys.push(key.to_string());
+        }
+    }
+    keys
+}
+
+fn normalize_client_api_key_name(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("调用密钥")
+        .chars()
+        .take(80)
+        .collect()
+}
+
+fn client_api_key_json(row: sqlx::sqlite::SqliteRow) -> Value {
+    json!({
+        "id": row.get::<i64, _>("id"),
+        "name": row.get::<String, _>("name"),
+        "key": row.get::<Option<String>, _>("key_value"),
+        "keyMask": row.get::<String, _>("key_mask"),
+        "enabled": row.get::<i64, _>("enabled") != 0,
+        "createdAt": row.get::<String, _>("created_at"),
+        "updatedAt": row.get::<String, _>("updated_at"),
+        "lastUsedAt": row.get::<Option<String>, _>("last_used_at")
+    })
+}
+
+fn client_api_key_db_error_message(value: &str) -> String {
+    if value.to_ascii_lowercase().contains("unique") {
+        "这个密钥已经存在".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    headers
+    let value = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_string)
+        .map(str::trim)?;
+    let (scheme, token) = value.split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
 }
 
 fn error(status: StatusCode, kind: &str, message: &str) -> Response {
@@ -4088,6 +5551,60 @@ fn sha256_hex(input: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn short_hash(value: &str) -> String {
+    sha256_hex(value).chars().take(12).collect()
+}
+
+fn redact_log_text(value: &str) -> String {
+    let mut out = Vec::new();
+    for part in value.split_whitespace().take(80) {
+        let lower = part.to_ascii_lowercase();
+        let redacted = if is_sensitive_log_part(part, &lower) {
+            "[redacted]"
+        } else {
+            part
+        };
+        out.push(redacted);
+    }
+    let mut text = out.join(" ");
+    if text.chars().count() > 300 {
+        text = text.chars().take(300).collect();
+    }
+    text
+}
+
+fn is_sensitive_log_part(part: &str, lower: &str) -> bool {
+    lower.contains("authorization")
+        || lower.contains("cookie")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("access_token")
+        || lower.contains("refresh_token")
+        || lower.contains("jwt")
+        || lower.contains("token")
+        || looks_like_jwt(part)
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    let trimmed = value.trim_matches(|ch: char| {
+        !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+    });
+    let mut parts = trimmed.split('.');
+    let Some(header) = parts.next() else {
+        return false;
+    };
+    let Some(payload) = parts.next() else {
+        return false;
+    };
+    let Some(signature) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && header.starts_with("eyJ")
+        && !payload.is_empty()
+        && !signature.is_empty()
+}
+
 fn is_legacy_static_tier_models(value: &Value) -> bool {
     let Some(models) = value.as_array() else {
         return false;
@@ -4108,6 +5625,7 @@ fn account_json(
     row: sqlx::sqlite::SqliteRow,
     model_limits: &HashMap<i64, Value>,
     sticky_counts: &HashMap<i64, i64>,
+    availability: Option<&AccountAvailability>,
 ) -> Value {
     let parse_json = |name: &str, fallback: Value| {
         row.get::<Option<String>, _>(name)
@@ -4143,6 +5661,7 @@ fn account_json(
         "lastUsed": row.get::<Option<String>, _>("last_used_at"),
         "lastProbed": row.get::<Option<String>, _>("last_probed_at"),
         "rateLimitedUntil": row.get::<Option<String>, _>("rate_limited_until"),
+        "rateLimitProbeAfter": row.get::<Option<String>, _>("rate_limit_probe_after"),
         "rateLimited": row.get::<Option<String>, _>("rate_limited_until").is_some_and(|value| {
             chrono::DateTime::parse_from_rfc3339(&value)
                 .map(|time| time.with_timezone(&Utc) > Utc::now())
@@ -4156,6 +5675,12 @@ fn account_json(
         "tierModels": tier_models,
         "blockedModels": parse_json("blocked_models_json", json!([])),
         "modelRateLimits": model_limits.get(&id).cloned().unwrap_or_else(|| json!({})),
+        "availability": availability.map(account_availability_json).unwrap_or_else(|| json!({
+            "available": false,
+            "kind": AvailabilityKind::StatusUnavailable,
+            "retryAfterSecs": 60,
+            "upstreamError": null
+        })),
         "stickyCount": sticky_counts.get(&id).copied().unwrap_or(0),
         "lastError": row.get::<Option<String>, _>("last_error"),
         "credentialMask": row.get::<Option<String>, _>("credential_mask"),
@@ -4165,6 +5690,15 @@ fn account_json(
         "lastLoginAt": row.get::<Option<String>, _>("last_login_at"),
         "createdAt": row.get::<String, _>("created_at"),
         "updatedAt": row.get::<String, _>("updated_at")
+    })
+}
+
+fn account_availability_json(availability: &AccountAvailability) -> Value {
+    json!({
+        "available": availability.available,
+        "kind": availability.kind,
+        "retryAfterSecs": availability.retry_after_secs,
+        "upstreamError": availability.upstream_error
     })
 }
 
@@ -4232,4 +5766,51 @@ async fn finish_trace(
     .execute(db)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_windsurf_reset_duration_without_trace_id() {
+        let message = "Reached message rate limit for this model. Please try again later. Resets in: 1h22m21s (trace ID: d38c923fabce64a67ff96f15c6840975)";
+        assert_eq!(parse_retry_after_secs(message), Some(4941));
+    }
+
+    #[test]
+    fn classifies_model_rate_limit() {
+        let settings = CapacitySettings::default();
+        let message = "Windsurf 远端 trailer 错误: {\"error\":{\"code\":\"permission_denied\",\"message\":\"Reached message rate limit for this model. Please try again later. Resets in: 26m32s\"}}";
+        assert_eq!(
+            classify_upstream_rate_limit(message, &settings),
+            Some(UpstreamRateLimit {
+                scope: UpstreamRateLimitScope::Model,
+                retry_after_secs: 1592
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_client_api_calls_when_no_enabled_key_exists() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&db).await.unwrap();
+        let headers = HeaderMap::new();
+        let err = require_client_api_key(&db, &headers, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(err.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value.pointer("/error/type").and_then(Value::as_str),
+            Some("client_api_key_required")
+        );
+    }
 }
