@@ -269,7 +269,7 @@
         <h2>目录</h2>
         <a href="#position">项目定位</a>
         <a href="#done">本窗口已完成</a>
-        <a href="#engine">WindsurfEngine 状态</a>
+        <a href="#engine">RemoteApiEngine 状态</a>
         <a href="#references">参考项目地图</a>
         <a href="#download">必须下载与本地配置</a>
         <a href="#submit">GitHub 提交清单</a>
@@ -295,7 +295,7 @@
         <h3>长期方向</h3>
         <ul>
           <li>后端用 Rust 承担账号池、并发控制、粘性会话、限流、真实 Windsurf LS 调用、兼容 OpenAI/Anthropic API。</li>
-          <li>前端用 React 管理账号、代理、批量登录、调用日志、容量参数、账号测试。</li>
+          <li>前端用 React 管理账号、代理、批量登录、调用日志、容量参数和账号探测。</li>
           <li>生产环境由 Rust 托管构建后的前端静态文件；开发环境前端单独跑 Vite 热更新。</li>
         </ul>
       </section>
@@ -310,8 +310,8 @@
             <tr><td>密码输入框</td><td><span class="status">已完成</span></td><td>新增 <code>admin-ui/src/components/SecretInput.tsx</code>，登录页、setup 页、添加账号弹窗密码输入框支持显示/隐藏。</td></tr>
             <tr><td>账号体系前端</td><td><span class="status">已推进</span></td><td>账号列表、标签显示、操作下拉、余额/等级/模型展示已多轮对齐，仍需继续精修模型和余额的真实数据来源。</td></tr>
             <tr><td>账号调度</td><td><span class="status">已推进</span></td><td>已落地容量控制、粘性会话、限流相关基础结构，后续要继续和真实 Engine 结合压测。</td></tr>
-            <tr><td>账号测试</td><td><span class="status">已推进</span></td><td>账号测试页支持模型下拉、测试内容保存、流式输出方向；后端已改为接真实 Engine 初版。</td></tr>
-            <tr><td>WindsurfEngine</td><td><span class="status">初版</span></td><td>Rust 版已接 <code>h2</code>、<code>bytes</code>、<code>tokio::process</code>，实现 LS 启动、warmup、Start/Send/Poll 基础 Cascade。</td></tr>
+            <tr><td>账号探测</td><td><span class="status">已完成入口迁移</span></td><td>独立账号测试入口已取消，账号列表操作菜单里的“探测账号”会打开弹窗，支持模型下拉、发送内容保存和真实 Engine 流式返回。</td></tr>
+            <tr><td>RemoteApiEngine</td><td><span class="status">主线</span></td><td>Rust 后端已移除本地运行时路线，改为读取 protobuf 模板、patch 账号和会话字段，直接请求 Windsurf 远端接口并解析流式返回。</td></tr>
           </tbody>
         </table>
         <h3>已验证命令</h3>
@@ -321,39 +321,36 @@ cd admin-ui &amp;&amp; pnpm build</code></pre>
       </section>
 
       <section id="engine" class="card">
-        <h2>WindsurfEngine 当前状态</h2>
-        <p>当前核心文件是 <code>crates/server/src/engine/mod.rs</code> 和 <code>crates/server/src/engine/proto.rs</code>。这不是最终完成版，但已经不是占位输出。</p>
+        <h2>RemoteApiEngine 当前状态</h2>
+        <p>当前核心文件是 <code>crates/server/src/engine/mod.rs</code> 和 <code>crates/server/src/engine/proto.rs</code>。运行链路已经改为远端模板调用，不再依赖本地 Windsurf 运行时。</p>
         <div class="grid">
           <div class="note ok">
             <h3>已实现</h3>
             <ul>
-              <li>从设置读取 <code>lsBinaryPath</code>、<code>lsDataDir</code>、<code>lsMaxInstances</code>、轮询/超时参数。</li>
-              <li>使用 <code>tokio::process::Command</code> 启动 Windsurf language server。</li>
-              <li>使用 <code>h2</code> 直连本地 LS，手工 gRPC frame。</li>
-              <li>实现 <code>InitializeCascadePanelState</code>、<code>AddTrackedWorkspace</code>、<code>UpdateWorkspaceTrust</code>、<code>Heartbeat</code> warmup。</li>
-              <li>实现 <code>StartCascade</code>、<code>SendUserCascadeMessage</code>、<code>GetCascadeTrajectorySteps</code>、<code>GetCascadeTrajectory</code>。</li>
-              <li>LS 池按账号 key + 代理隔离，避免多账号共享同一 LS session。</li>
-              <li><code>/admin/account-test</code> 和 <code>/v1/messages</code> 已改走共享 <code>WindsurfEngine</code>。</li>
+              <li>从设置读取 <code>remoteApiBaseUrl</code>、<code>remoteTemplateDir</code>、<code>remoteRequestTimeoutMs</code>。</li>
+              <li>内置 <code>GetChatMessage</code> 等请求模板，并支持外部模板目录覆盖。</li>
+              <li>实现 connect-proto gzip frame 编解码和远端流式响应解析。</li>
+              <li><code>/v1/messages</code> 已改走共享 <code>RemoteApiEngine</code>。</li>
+              <li><code>/admin/accounts/{id}/probe</code> 直接用目标账号调用远端引擎，不占用全局调度槽。</li>
+              <li>账号列表顶部“刷新状态”只刷新账号状态/余额，不触发批量真实模型对话，避免一键触发风控。</li>
             </ul>
           </div>
           <div class="note warn">
             <h3>仍需补齐</h3>
             <ul>
-              <li>当前只做 Cascade 基础路径；Raw legacy 未做。</li>
+              <li>当前优先覆盖 Anthropic 文本消息；OpenAI 兼容未做。</li>
               <li>图片输入未做。</li>
-              <li>native tool bridge 未做。</li>
+              <li>工具调用完整映射未做。</li>
               <li>token usage 还不是原版完整逻辑。</li>
-              <li>当前 <code>cascade_stream</code> 内部仍偏批量收集后 yield，后续要改成边 poll 边 yield。</li>
-              <li>settings 里的 <code>lsBinaryPath</code> 当前随后端启动加载，改设置后需要重启后端。</li>
               <li>还没有跑真实 Windsurf 官方请求验证；这是外部生产 API 调用，需要操作者确认。</li>
             </ul>
           </div>
         </div>
         <h3>关键实现判断</h3>
         <ul>
-          <li>不要把 LS Engine 做成 Node sidecar。当前方向是 Rust 后端直接管理 LS 进程与 gRPC。</li>
-          <li>不要重新发明协议。字段号、调用顺序、stall/retry 策略都以原版 <code>WindsurfAPI</code> 为真相源。</li>
-          <li>4h4g 服务器上不能为每个请求无限起 LS。要靠账号池、并发控制、LS 池上限、粘性会话、队列和限流共同控制。</li>
+          <li>不再保留本地运行时路线。当前方向是 Rust 后端直接请求 Windsurf 远端接口。</li>
+          <li>不要重新发明协议。字段号、模板 patch 和 frame parser 以 ZephyrSail 提取资料为当前真相源。</li>
+          <li>4h4g 服务器上主要靠账号池、并发控制、粘性会话、队列和限流控制容量。</li>
         </ul>
       </section>
 
@@ -411,25 +408,17 @@ cd admin-ui &amp;&amp; pnpm build</code></pre>
       </section>
 
       <section id="download" class="card">
-        <h2>必须下载与本地配置</h2>
+        <h2>远端模板与本地配置</h2>
         <div class="note warn">
-          <p><strong>Windsurf language server 二进制不要默认随仓库提交。</strong>需要在文档/README 提示使用者下载对应平台版本，然后在管理台 settings 或数据库里配置 <code>lsBinaryPath</code>。</p>
+          <p><strong>不需要下载本地 Windsurf 运行时。</strong>后端默认使用仓库内置 protobuf 模板；如果上游协议变化，可以通过外部模板目录覆盖。</p>
         </div>
-        <h3>本地已见到的二进制</h3>
-        <ul>
-          <li><code>WindsurfAPI/.local/bin/language_server_macos_x64</code></li>
-        </ul>
-        <p>注意本机如果是 Apple Silicon，<code>macos_x64</code> 可能需要 Rosetta 或换 arm64 版本。服务器通常需要 Linux x64 版本。</p>
         <h3>后端相关设置</h3>
         <table>
           <thead><tr><th>设置项</th><th>说明</th></tr></thead>
           <tbody>
-            <tr><td><code>lsBinaryPath</code></td><td>LS 二进制绝对或相对路径。未配置时真实调用会返回“请先配置 LS 二进制路径”。</td></tr>
-            <tr><td><code>lsDataDir</code></td><td>LS 数据目录，默认使用后端数据目录下的 <code>ls</code>。</td></tr>
-            <tr><td><code>lsMaxInstances</code></td><td>LS 进程池上限，默认 20。4h4g 机器必须谨慎设置。</td></tr>
-            <tr><td><code>cascadePollIntervalMs</code></td><td>Cascade 轮询间隔，默认 500ms。</td></tr>
-            <tr><td><code>cascadeMaxWaitMs</code></td><td>单次 Cascade 最大等待，默认 600000ms。</td></tr>
-            <tr><td><code>cascadeWarmStallMs</code></td><td>有输出后长时间无增长的接受/停止阈值，默认 45000ms。</td></tr>
+            <tr><td><code>remoteApiBaseUrl</code></td><td>远端 Windsurf 接口地址，默认 <code>https://server.self-serve.windsurf.com</code>。</td></tr>
+            <tr><td><code>remoteTemplateDir</code></td><td>外部模板目录。为空时使用仓库内置模板。</td></tr>
+            <tr><td><code>remoteRequestTimeoutMs</code></td><td>单次远端请求超时时间，默认 120000ms。</td></tr>
           </tbody>
         </table>
         <h3>开发启动</h3>
@@ -443,7 +432,7 @@ pnpm dev --host 127.0.0.1 --port 9527</code></pre>
 
       <section id="submit" class="card">
         <h2>GitHub 提交清单</h2>
-        <p>当前目录之前检查过不是 git 仓库，真正提交前要确认目标仓库位置或初始化仓库。这里先列应该纳入版本管理的内容。</p>
+        <p>当前仓库远端是 <code>https://github.com/shusfun/wind.rs.git</code>。提交信息使用中文 Conventional Commit，作者名已按要求改为 <code>shus</code>。</p>
         <h3>应该提交</h3>
         <ul>
           <li><code>crates/server/src/engine/mod.rs</code></li>
@@ -473,7 +462,7 @@ find .tmp/claude-code -type f -size +50M -exec ls -lh {} \;</code></pre>
       <section id="dont-submit" class="card">
         <h2>禁止提交内容</h2>
         <div class="note warn">
-          <p>当前 <code>.gitignore</code> 只有 <code>.ace-tool/</code>，明显不够。下一步进入 git 仓库后应补充忽略规则，避免误传账号、数据库、日志和构建产物。</p>
+          <p><code>.gitignore</code> 已覆盖环境文件、数据库、日志、构建产物、<code>.tmp/*</code> 和本地 <code>WindsurfAPI/</code> 参考目录；提交前仍要用 <code>git status --short</code> 复查。</p>
         </div>
         <ul>
           <li><code>.env.local</code>：里面有远端日志 SSH 密码，不能提交。</li>
@@ -504,17 +493,13 @@ WindsurfAPI/.tmp/
       <section id="next" class="card">
         <h2>下一窗口 TODO</h2>
         <ol>
-          <li>确认当前目录的目标 Git 仓库。如果仍不是 git 仓库，先确认是否要初始化，或切到正确 repo。</li>
-          <li>补充 <code>.gitignore</code>，明确 <code>.tmp/claude-code/</code> 仅本地保留，不提交。</li>
-          <li>补 README/文档说明 LS 二进制下载、放置和 <code>lsBinaryPath</code> 配置。</li>
           <li>启动后端与前端，进入 setup 设置新管理 key。</li>
-          <li>在 settings 配置 LS 二进制路径，重启后端。</li>
-          <li>用管理台账号测试发真实请求，记录原始输入、流式返回、错误和 LS 日志。</li>
-          <li>如果真实请求失败，优先对照 <code>WindsurfAPI/src/client.js</code> 的 panel retry、untrusted workspace、expired cascade 恢复逻辑。</li>
-          <li>把 <code>cascade_stream</code> 改成真正边 poll 边 yield，避免长请求到结束才输出。</li>
-          <li>补模型目录和账号 probe：参考 <code>WindsurfAPI/src/windsurf-api.js</code>，让模型不是假数据。</li>
+          <li>用账号列表单个账号的“探测账号”发真实请求，记录原始输入、流式返回和错误。</li>
+          <li>如果真实请求失败，优先对照 ZephyrSail 的 <code>buildChatMessageRequest</code>、<code>streamChatMessage</code>、<code>parseGetChatMessageFrame</code>。</li>
+          <li>补齐工具调用、图片输入、reasoning 和 usage 映射。</li>
+          <li>继续补模型目录：参考 <code>WindsurfAPI/src/windsurf-api.js</code>，让模型不是假数据。</li>
           <li>继续对齐前端账号列表：余额、等级、模型下拉、操作列、列宽、合并展示。</li>
-          <li>围绕 4h4g + 两三百用户目标做容量压测：LS 实例数、队列、账号并发、IP 级限流、模型级限流。</li>
+          <li>围绕 4h4g + 两三百用户目标做容量压测：队列、账号并发、IP 级限流、模型级限流。</li>
         </ol>
         <div class="note ok">
           <p><strong>下一窗口第一句话建议：</strong>“请读取 <code>docs/window-handoff-2026-05-21.html</code>，按里面的 TODO 继续，不要重新调研。”</p>

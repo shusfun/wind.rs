@@ -417,7 +417,7 @@
           <tr>
             <td>WindsurfAPI</td>
             <td><code>WindsurfAPI/</code></td>
-            <td>行为参考、Windsurf 登录和 LS 调用样本、旧 dashboard 功能清单。</td>
+            <td>行为参考、Windsurf 登录、旧 dashboard 功能清单；本地运行时路线已废弃。</td>
           </tr>
           <tr>
             <td>CPA</td>
@@ -470,7 +470,7 @@
           </ul>
           <pre><code>sub2api -> Rust 后端 /v1/messages
   -> 账号调度
-  -> Windsurf LS
+  -> RemoteApiEngine 直连 Windsurf 远端接口
   -> Anthropic Messages SSE/JSON 输出</code></pre>
         </article>
         <article class="card">
@@ -516,7 +516,7 @@
           </tr>
           <tr>
             <td><code>/requests</code></td>
-            <td>调用日志、原始输入、LS 原始输出、转换后输出、结束原因。</td>
+            <td>调用日志、原始输入、远端原始输出、转换后输出、结束原因。</td>
           </tr>
           <tr>
             <td><code>/proxies</code></td>
@@ -524,7 +524,7 @@
           </tr>
           <tr>
             <td><code>/settings</code></td>
-            <td>模型、调度参数、LS 路径、日志配置。</td>
+            <td>模型、调度参数、远端模板、日志配置。</td>
           </tr>
         </tbody>
       </table>
@@ -555,16 +555,16 @@
     <section id="backend">
       <h2>后端模块建议</h2>
       <div class="grid">
-        <article class="card"><h3>config</h3><p>端口、数据目录、LS 路径、日志配置、调度参数。</p></article>
+        <article class="card"><h3>config</h3><p>端口、数据目录、远端接口、模板目录、日志配置、调度参数。</p></article>
         <article class="card"><h3>db</h3><p>SQLite 连接、迁移、事务。</p></article>
         <article class="card"><h3>auth</h3><p>setup、admin key hash、session token。</p></article>
         <article class="card"><h3>accounts</h3><p>Windsurf 账号、状态、冷却、失败计数、代理绑定。</p></article>
         <article class="card"><h3>proxies</h3><p>代理池、检测结果、账号绑定。</p></article>
         <article class="card"><h3>scheduler</h3><p>账号选择、租约、并发限制、冷却、结果反馈。</p></article>
         <article class="card"><h3>login_jobs</h3><p>批量登录任务，严格串行、随机延迟、失败退避、SSE 进度。</p></article>
-        <article class="card"><h3>ls_manager</h3><p>Windsurf language server 生命周期、按账号启动/复用、健康检查、重启。</p></article>
+        <article class="card"><h3>remote_engine</h3><p>模板加载、请求 patch、远端流式请求、frame 解析。</p></article>
         <article class="card"><h3>anthropic</h3><p><code>/v1/messages</code> 请求/响应类型、SSE 输出、错误格式。</p></article>
-        <article class="card"><h3>trace</h3><p>请求证据：原始输入、账号选择、LS 原始输出、转换后输出、结束原因。</p></article>
+        <article class="card"><h3>trace</h3><p>请求证据：原始输入、账号选择、远端原始输出、转换后输出、结束原因。</p></article>
         <article class="card"><h3>web</h3><p>开发使用 Vite，生产使用 <code>tower-http</code> 托管 React 构建产物。</p></article>
       </div>
     </section>
@@ -588,7 +588,7 @@
         <article class="card">
           <h3>证据要求</h3>
           <p><code>request_traces</code> 必须能定位“输出一直不停”的原因。每条请求至少记录请求 ID、模型、stream、选中账号、开始时间、结束时间、结束原因、错误摘要。</p>
-          <p>流式证据需要分层记录：客户端原始请求、LS 原始事件、转换后下游事件。</p>
+          <p>流式证据需要分层记录：客户端原始请求、远端原始事件、转换后下游事件。</p>
         </article>
       </div>
     </section>

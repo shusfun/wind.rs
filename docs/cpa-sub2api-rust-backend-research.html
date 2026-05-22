@@ -539,7 +539,7 @@
           <tr>
             <td><code>GET /admin/requests/:id</code></td>
             <td><span class="status warn">P1</span></td>
-            <td>查看原始输入、LS 原始输出、转换后输出和结束原因。</td>
+            <td>查看原始输入、远端原始输出、转换后输出和结束原因。</td>
           </tr>
         </tbody>
       </table>
@@ -565,8 +565,8 @@
           <p>批量 Windsurf 登录任务系统，支持串行、随机延迟、失败退避、暂停/取消、进度 SSE。</p>
         </article>
         <article class="card">
-          <h3>ls_manager</h3>
-          <p>管理 Windsurf language server 生命周期、按账号绑定、健康检查、重启、超时和 stderr/stdout 采集。</p>
+          <h3>remote_engine</h3>
+          <p>管理远端模板、请求 patch、Windsurf 远端流式调用、超时和错误归类。</p>
         </article>
         <article class="card">
           <h3>openai_compat</h3>
@@ -574,7 +574,7 @@
         </article>
         <article class="card">
           <h3>trace</h3>
-          <p>记录请求证据：原始入参、选中账号、LS 原始返回、转换结果、结束原因、耗时和错误。</p>
+          <p>记录请求证据：原始入参、选中账号、远端原始返回、转换结果、结束原因、耗时和错误。</p>
         </article>
       </div>
     </section>
