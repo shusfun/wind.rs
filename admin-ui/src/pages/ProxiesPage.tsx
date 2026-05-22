@@ -1,13 +1,13 @@
 import { FormEvent, useEffect, useState } from 'react';
 import { PageHeader } from '../components/PageHeader';
-import { StateBlock } from '../components/StateBlock';
+import { useToast } from '../components/Toast';
 import { ProxyItem, api } from '../lib/api';
 
 export function ProxiesPage() {
   const [proxies, setProxies] = useState<ProxyItem[]>([]);
   const [name, setName] = useState('');
   const [url, setUrl] = useState('');
-  const [error, setError] = useState('');
+  const { showToast } = useToast();
 
   async function load() {
     const data = await api.proxies();
@@ -15,19 +15,19 @@ export function ProxiesPage() {
   }
 
   useEffect(() => {
-    load().catch((err) => setError(err instanceof Error ? err.message : '读取失败'));
+    load().catch((err) => showToast(err instanceof Error ? err.message : '读取失败', 'error'));
   }, []);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    setError('');
     try {
       await api.createProxy({ name, url });
       setName('');
       setUrl('');
+      showToast('代理已添加', 'success');
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : '保存失败');
+      showToast(err instanceof Error ? err.message : '保存失败', 'error');
     }
   }
 
@@ -42,7 +42,6 @@ export function ProxiesPage() {
             添加代理
           </button>
         </form>
-        {error ? <StateBlock message={error} /> : null}
         <table>
           <thead>
             <tr>

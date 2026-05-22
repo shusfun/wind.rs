@@ -221,6 +221,10 @@
     @apply min-h-9.5 border border-border-strong bg-surface-2 px-3.5 text-text-main;
   }
 
+  .secondary-button.danger {
+    @apply border-danger/35 text-danger hover:bg-danger/10;
+  }
+
   .text-button {
     @apply min-h-7.5 border border-border-soft bg-surface-2 px-2.5 py-1 text-text-main;
   }
@@ -259,6 +263,26 @@
     @apply border-danger/25 bg-danger/15 text-danger;
   }
 
+  .toast-viewport {
+    @apply fixed right-5 top-5 z-[1200] grid w-[min(360px,calc(100vw-40px))] gap-2 pointer-events-none;
+  }
+
+  .toast-item {
+    @apply pointer-events-auto grid grid-cols-[1fr_24px] items-center gap-3 rounded-md border border-border-strong bg-surface px-3.5 py-3 text-sm text-text-main shadow-[0_18px_45px_rgba(0,0,0,0.45)];
+  }
+
+  .toast-item button {
+    @apply inline-flex h-6 w-6 items-center justify-center rounded border border-transparent text-text-muted hover:border-border-soft hover:bg-surface-2 hover:text-text-main;
+  }
+
+  .toast-success {
+    @apply border-success/35;
+  }
+
+  .toast-error {
+    @apply border-danger/35;
+  }
+
   .status-badge {
     @apply inline-flex min-h-5.5 items-center rounded-full bg-success/15 px-2.5 text-xs font-extrabold text-success;
   }
@@ -295,19 +319,23 @@
   }
 
   .event-list.compact {
-    @apply max-h-80 overflow-auto;
+    @apply max-h-[360px] overflow-auto pr-1;
   }
 
   .event-item {
-    @apply grid grid-cols-[90px_minmax(0,1fr)_auto] items-center gap-2.5 rounded-md border border-border-soft bg-bg-elev px-2.5 py-2;
+    @apply grid grid-cols-[96px_minmax(0,1fr)_auto] items-start gap-2.5 rounded-md border border-border-soft bg-bg-elev px-2.5 py-2;
+  }
+
+  .event-item strong {
+    @apply text-xs text-text-main;
   }
 
   .event-item span {
-    @apply min-w-0 break-words text-text-muted;
+    @apply min-w-0 break-words font-mono text-xs leading-5 text-text-muted;
   }
 
   .event-item small {
-    @apply text-text-dim;
+    @apply whitespace-nowrap text-[11px] text-text-dim;
   }
 
   .event-failed,
@@ -317,6 +345,14 @@
 
   .event-success {
     @apply border-success/35 bg-success/15;
+  }
+
+  .event-progress {
+    @apply border-accent/35 bg-accent/10;
+  }
+
+  .event-waiting {
+    @apply border-warn/35 bg-warn/10;
   }
 
   .auth-screen {
@@ -340,7 +376,7 @@
   }
 
   .account-toolbar {
-    @apply mb-4 grid grid-cols-[repeat(3,minmax(160px,1fr))_auto] gap-3;
+    @apply mb-4 grid grid-cols-[repeat(4,minmax(150px,1fr))_auto] gap-3;
   }
 
   .toolbar-stat {
@@ -349,6 +385,10 @@
 
   .toolbar-stat strong {
     @apply text-xl text-text-main;
+  }
+
+  .toolbar-stat.live-stat strong {
+    @apply truncate text-sm;
   }
 
   .toolbar-actions {
@@ -534,6 +574,19 @@
     @apply grid grid-cols-[auto_1fr] items-center gap-x-1.5 gap-y-0.5 text-warn;
   }
 
+  .limit-cell.availability-ok {
+    @apply text-success;
+  }
+
+  .limit-cell.availability-probing,
+  .limit-cell.availability-warn {
+    @apply text-warn;
+  }
+
+  .limit-cell.availability-danger {
+    @apply text-danger;
+  }
+
   .limit-cell span {
     @apply truncate text-xs font-bold;
   }
@@ -682,6 +735,10 @@
     @apply flex items-start justify-between gap-4 border-b border-border-soft px-5 py-4;
   }
 
+  .modal-head p {
+    @apply mt-1 text-sm text-text-muted;
+  }
+
   .segmented-control {
     @apply ml-5 mt-4 inline-flex justify-self-start rounded-md border border-border-soft bg-bg-elev p-0.75;
   }
@@ -710,28 +767,158 @@
     @apply flex items-center justify-end gap-2.5;
   }
 
+  .model-picker {
+    @apply relative;
+  }
+
+  .model-picker-button {
+    @apply flex min-h-10.5 w-full items-center justify-between gap-3 rounded-md border border-border-strong bg-bg-elev px-3 py-2.5 text-left text-text-main outline-none hover:border-accent focus:border-accent focus:ring-3 focus:ring-accent/15 disabled:bg-surface-2 disabled:text-text-dim;
+  }
+
+  .model-picker-button span {
+    @apply min-w-0 truncate;
+  }
+
+  .model-picker-popover {
+    @apply absolute left-0 right-0 top-[calc(100%+6px)] z-[70] grid gap-1 rounded-md border border-border-strong bg-surface p-1 shadow-[0_18px_60px_rgba(0,0,0,0.55)];
+  }
+
+  .model-picker-search {
+    @apply grid grid-cols-[18px_minmax(0,1fr)] items-center gap-2 rounded border border-border-soft bg-bg-elev px-2.5 py-1.5 text-text-muted;
+  }
+
+  .model-picker-search input {
+    @apply min-h-0 border-0 bg-transparent p-0 text-[13px] focus:ring-0;
+  }
+
+  .model-picker-list {
+    @apply grid max-h-72 overflow-auto;
+  }
+
+  .model-picker-list button {
+    @apply grid gap-0.5 rounded px-3 py-2 text-left text-text-main hover:bg-surface-3;
+  }
+
+  .model-picker-list button.active {
+    @apply bg-accent/15 text-white;
+  }
+
+  .model-picker-list strong {
+    @apply min-w-0 truncate text-[13px];
+  }
+
+  .model-picker-list span {
+    @apply min-w-0 truncate font-mono text-[11px] text-text-muted;
+  }
+
+  .model-picker-empty {
+    @apply px-3 py-5 text-center text-xs text-text-dim;
+  }
+
   .job-console {
-    @apply rounded-[10px] border border-border-soft bg-bg-elev p-3.5;
+    @apply grid gap-3.5 rounded-[10px] border border-border-soft bg-bg-elev p-3.5;
+  }
+
+  .job-console-head {
+    @apply flex items-start justify-between gap-3;
+  }
+
+  .job-console-head h3 {
+    @apply m-0 text-lg font-extrabold;
+  }
+
+  .job-console-head p {
+    @apply mt-1 mb-0 text-xs text-text-muted;
+  }
+
+  .job-progress-panel {
+    @apply grid grid-cols-[128px_minmax(0,1fr)] items-center gap-4 rounded-md border border-border-soft bg-surface p-4;
+  }
+
+  .job-progress-number {
+    @apply grid gap-1;
+  }
+
+  .job-progress-number strong {
+    @apply text-4xl font-black leading-none text-text-main;
+  }
+
+  .job-progress-number span {
+    @apply text-xs font-bold text-text-muted;
+  }
+
+  .job-progress-main {
+    @apply grid gap-3;
+  }
+
+  .job-progress-track {
+    @apply h-3 overflow-hidden rounded-full border border-border-soft bg-bg;
+  }
+
+  .job-progress-track i {
+    @apply block h-full rounded-full bg-[linear-gradient(90deg,#22c55e,#38bdf8)] transition-[width] duration-300;
+  }
+
+  .job-progress-meta {
+    @apply flex flex-wrap gap-2 text-xs font-bold text-text-muted;
+  }
+
+  .job-progress-meta span {
+    @apply rounded border border-border-soft bg-bg-elev px-2 py-1;
+  }
+
+  .job-progress-meta .waiting {
+    @apply border-warn/35 bg-warn/10 text-warn;
+  }
+
+  .current-account-line {
+    @apply grid grid-cols-[72px_minmax(0,1fr)_auto] items-center gap-2 rounded-md border border-border-soft bg-surface px-3 py-2.5;
+  }
+
+  .current-account-line span,
+  .current-account-line small {
+    @apply text-xs text-text-dim;
+  }
+
+  .current-account-line strong {
+    @apply min-w-0 break-words font-mono text-sm text-text-main;
   }
 
   .job-columns {
-    @apply grid grid-cols-[minmax(300px,0.8fr)_minmax(360px,1.2fr)] gap-3.5;
+    @apply grid grid-cols-[minmax(420px,1fr)_minmax(260px,0.45fr)] gap-3.5;
   }
 
   .job-columns h3 {
     @apply mb-2.5 mt-0 text-[13px] font-bold;
   }
 
+  .job-log-section,
+  .job-list-section {
+    @apply min-w-0;
+  }
+
   .mini-table {
-    @apply grid gap-2;
+    @apply grid max-h-[360px] gap-2 overflow-auto pr-1;
   }
 
   .mini-row {
-    @apply grid grid-cols-[82px_1fr_auto_34px] items-center gap-2 rounded-md border border-border-soft bg-surface p-2 text-text-muted;
+    @apply grid grid-cols-[82px_1fr_auto_34px] items-center gap-2 rounded-md border border-border-soft bg-surface p-2 text-xs text-text-muted;
   }
 
   .mini-row.active {
     @apply border-accent;
+  }
+
+  .batch-input-panel {
+    @apply rounded-[10px] border border-border-soft bg-bg-elev;
+  }
+
+  .batch-input-panel summary {
+    @apply cursor-pointer px-3.5 py-3 text-sm font-extrabold text-text-main;
+  }
+
+  .batch-input-body {
+    @apply grid gap-4 border-t border-border-soft p-3.5;
   }
 
   .empty-panel {
@@ -744,6 +931,58 @@
 
   .capacity-panel {
     @apply max-w-5xl;
+  }
+
+  .settings-section {
+    @apply grid gap-3 rounded-md border border-border-soft bg-bg-elev p-4;
+  }
+
+  .settings-section h3 {
+    @apply text-base font-extrabold text-text-main;
+  }
+
+  .settings-section p {
+    @apply mt-1 max-w-2xl text-sm text-text-muted;
+  }
+
+  .settings-section textarea {
+    @apply min-h-30 resize-y rounded-md border border-border-soft bg-surface px-3 py-2 font-mono text-sm text-text-main outline-none focus:border-accent;
+  }
+
+  .api-key-table-panel {
+    @apply p-0;
+  }
+
+  .api-key-modal {
+    @apply w-[min(520px,100%)];
+  }
+
+  .table-title {
+    @apply flex items-center justify-between gap-3 border-b border-border-soft px-4 py-3;
+  }
+
+  .table-title span {
+    @apply text-sm text-text-muted;
+  }
+
+  .row-actions {
+    @apply flex flex-wrap items-center gap-2;
+  }
+
+  .name-button {
+    @apply max-w-52 truncate rounded border border-transparent bg-transparent px-2 py-1 text-left font-bold text-text-main hover:border-border-soft hover:bg-surface-2;
+  }
+
+  .inline-edit {
+    @apply grid min-w-64 grid-cols-[minmax(140px,1fr)_34px_34px] items-center gap-2;
+  }
+
+  .key-copy {
+    @apply w-full cursor-copy justify-start border-border-soft bg-surface-2 text-left hover:border-accent hover:text-white;
+  }
+
+  .inline-empty {
+    @apply m-4 min-h-52;
   }
 
   .capacity-runtime {
@@ -764,6 +1003,7 @@
     .account-toolbar,
     .metric-grid,
     .field-grid.compact,
+    .job-progress-panel,
     .job-columns {
       @apply grid-cols-2;
     }
@@ -786,6 +1026,7 @@
     .field-grid,
     .field-grid.compact,
     .account-toolbar,
+    .job-progress-panel,
     .job-columns,
     .detail-grid {
       @apply grid-cols-1;

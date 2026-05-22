@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useState } from 'react';
 import { Save } from 'lucide-react';
 import { PageHeader } from '../components/PageHeader';
-import { StateBlock } from '../components/StateBlock';
+import { useToast } from '../components/Toast';
 import { api, CapacitySettings } from '../lib/api';
 
 const fallbackSettings: CapacitySettings = {
@@ -20,7 +20,7 @@ const fallbackSettings: CapacitySettings = {
 export function SettingsPage() {
   const [settings, setSettings] = useState<CapacitySettings>(fallbackSettings);
   const [globalInflight, setGlobalInflight] = useState(0);
-  const [message, setMessage] = useState('');
+  const { showToast } = useToast();
 
   useEffect(() => {
     api.capacity()
@@ -28,14 +28,14 @@ export function SettingsPage() {
         setSettings(data.settings);
         setGlobalInflight(data.runtime.globalInflight);
       })
-      .catch((err) => setMessage(err instanceof Error ? err.message : '读取失败'));
+      .catch((err) => showToast(err instanceof Error ? err.message : '读取失败', 'error'));
   }, []);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
     const data = await api.saveCapacity(settings);
     setSettings(data.settings);
-    setMessage('设置已保存');
+    showToast('设置已保存', 'success');
   }
 
   function setNumber(key: keyof CapacitySettings, value: string) {
@@ -92,7 +92,6 @@ export function SettingsPage() {
             <input type="number" min={1} value={settings.stickySessionMinutes} onChange={(event) => setNumber('stickySessionMinutes', event.target.value)} />
           </label>
         </div>
-        {message ? <StateBlock message={message} /> : null}
         <button className="primary-button" type="submit">
           <Save size={16} />
           保存设置

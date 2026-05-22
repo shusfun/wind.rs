@@ -10,6 +10,35 @@ export type ApiErrorBody = {
   };
 };
 
+export type AdminEvent = {
+  kind: string;
+  payload?: Record<string, unknown>;
+  createdAt?: string;
+  created_at?: string;
+};
+
+export type AccountAvailabilityKind =
+  | 'available'
+  | 'probing'
+  | 'account_rate_limited'
+  | 'model_rate_limited'
+  | 'rpm_full'
+  | 'tier_expired'
+  | 'model_blocked'
+  | 'credential_missing'
+  | 'concurrency_full'
+  | 'status_error'
+  | 'status_disabled'
+  | 'status_banned'
+  | 'status_unavailable';
+
+export type AccountAvailability = {
+  available: boolean;
+  kind: AccountAvailabilityKind;
+  retryAfterSecs: number;
+  upstreamError?: string | null;
+};
+
 export type Account = {
   id: number;
   email: string;
@@ -34,7 +63,8 @@ export type Account = {
   availableModels: AccountModel[];
   tierModels: AccountModel[] | string[];
   blockedModels: string[];
-  modelRateLimits?: Record<string, { limitedUntil: string; reason?: string | null }>;
+  modelRateLimits?: Record<string, { limitedUntil: string; reason?: string | null; probeAfter?: string | null }>;
+  availability?: AccountAvailability;
   stickyCount: number;
   lastError?: string | null;
   credentialMask?: string | null;
@@ -126,6 +156,7 @@ export type LoginJobEvent = {
   type: string;
   index?: number;
   total?: number;
+  email?: string;
   emailMasked?: string;
   status?: string;
   accountId?: number | null;
@@ -166,6 +197,17 @@ export type ModelListItem = {
   _windsurf?: AccountModel;
 };
 
+export type ClientApiKey = {
+  id: number;
+  name: string;
+  key?: string | null;
+  keyMask: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt?: string | null;
+};
+
 export function getToken() {
   return localStorage.getItem('windsurf_rs_token') || '';
 }
@@ -176,6 +218,10 @@ export function setToken(token: string) {
 
 export function clearToken() {
   localStorage.removeItem('windsurf_rs_token');
+}
+
+export function authHeaders() {
+  return { authorization: `Bearer ${getToken()}` };
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -243,8 +289,18 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   deleteAccount: (id: number) => envelope<Record<string, never>>(`/admin/accounts/${id}`, { method: 'DELETE' }),
-  probeAccount: (id: number) => envelope<Record<string, unknown>>(`/admin/accounts/${id}/probe`, { method: 'POST' }),
-  probeAccounts: () => envelope<{ results: unknown[] }>('/admin/accounts/probe-all', { method: 'POST' }),
+  probeAccountDefaults: () => envelope<{ model: string; message: string; models: AccountModel[] }>('/admin/accounts/probe-defaults'),
+  probeAccount: (id: number, payload: { model: string; message: string; saveDefaults?: boolean }, signal?: AbortSignal) =>
+    fetch(`/admin/accounts/${id}/probe`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${getToken()}`,
+      },
+      body: JSON.stringify(payload),
+      signal,
+    }),
+  refreshAccountsStatus: () => envelope<{ results: unknown[] }>('/admin/accounts/refresh-status', { method: 'POST' }),
   refreshAccountCredits: (id: number) => envelope<Record<string, unknown>>(`/admin/accounts/${id}/refresh-credits`, { method: 'POST' }),
   refreshAccountsCredits: () => envelope<{ results: unknown[] }>('/admin/accounts/refresh-credits', { method: 'POST' }),
   resetAccountErrors: (id: number) => envelope<Record<string, never>>(`/admin/accounts/${id}/reset-errors`, { method: 'POST' }),
@@ -270,22 +326,24 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   cancelLoginJob: (id: string) => envelope<Record<string, never>>(`/admin/login-jobs/${id}/cancel`, { method: 'POST' }),
+  clientApiKeys: () => envelope<{ keys: ClientApiKey[] }>('/admin/client-api-keys'),
+  createClientApiKey: (payload: { name?: string; key?: string; enabled?: boolean }) =>
+    envelope<{ id: number; key: string }>('/admin/client-api-keys', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  updateClientApiKey: (id: number, payload: { name?: string; key?: string; enabled?: boolean }) =>
+    envelope<Record<string, never>>(`/admin/client-api-keys/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+  deleteClientApiKey: (id: number) => envelope<Record<string, never>>(`/admin/client-api-keys/${id}`, { method: 'DELETE' }),
   requests: () => envelope<{ requests: RequestTrace[] }>('/admin/requests'),
   requestDetail: (id: string) => envelope<{ request: RequestTrace; chunks: TraceChunk[] }>(`/admin/requests/${id}`),
   capacity: () => envelope<{ settings: CapacitySettings; runtime: CapacityRuntime }>('/admin/capacity'),
   saveCapacity: (payload: CapacitySettings) =>
     envelope<{ settings: CapacitySettings }>('/admin/capacity', {
       method: 'PUT',
-      body: JSON.stringify(payload),
-    }),
-  accountTestDefaults: () => envelope<{ model: string; message: string; models: AccountModel[] }>('/admin/account-test'),
-  runAccountTest: (payload: { accountId?: number; model: string; message: string; stream?: boolean; saveDefaults?: boolean }) =>
-    fetch('/admin/account-test', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${getToken()}`,
-      },
       body: JSON.stringify(payload),
     }),
   settings: () => envelope<Record<string, string>>('/admin/settings'),
