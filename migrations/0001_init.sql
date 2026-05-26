@@ -99,6 +99,8 @@ CREATE TABLE IF NOT EXISTS request_trace_chunks (
   trace_id TEXT NOT NULL,
   layer TEXT NOT NULL,
   payload TEXT NOT NULL,
+  payload_path TEXT,
+  payload_size INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
 

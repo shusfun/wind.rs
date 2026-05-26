@@ -10,23 +10,24 @@ use axum::{
     },
     routing::{get, get_service, patch, post},
 };
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use clap::Parser;
 use rand::Rng;
+use regex::Regex;
 use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Component, PathBuf},
     sync::Arc,
     time::{Duration as StdDuration, Instant},
 };
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
@@ -36,7 +37,13 @@ use tracing_subscriber::{EnvFilter, fmt};
 use uuid::Uuid;
 
 mod engine;
-use engine::{EngineAccount, EngineConfig, EngineMessage, EngineModel, RemoteApiEngine};
+use engine::{
+    EngineAccount, EngineConfig, EngineMessage, EngineModel, EnginePreflightFailure,
+    EngineSamplingParams, EngineTool, EngineToolChoice, RemoteApiEngine, SystemPromptMode,
+};
+
+const LOG_RETENTION_DAYS: u64 = 7;
+const TRACE_PAYLOAD_PREVIEW_CHARS: usize = 1200;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -55,6 +62,25 @@ struct AppState {
     db: SqlitePool,
     engine: RemoteApiEngine,
     events: broadcast::Sender<AdminEvent>,
+    branch_gate: BranchGate,
+    data_dir: PathBuf,
+}
+
+#[derive(Clone, Default)]
+struct BranchGate {
+    inner: Arc<Mutex<HashMap<String, BranchGateState>>>,
+}
+
+#[derive(Debug, Clone)]
+struct BranchGateState {
+    recent_tool_request_at: Instant,
+    fingerprints: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchGateDecision {
+    Allow,
+    SuppressNoToolBranch,
 }
 
 #[derive(Clone)]
@@ -83,6 +109,7 @@ struct SchedulerAccount {
     email: String,
     status: String,
     tier: String,
+    tier_manual: bool,
     max_concurrent: i64,
     current_concurrent: i64,
     last_used_at: Option<String>,
@@ -90,6 +117,9 @@ struct SchedulerAccount {
     rate_limit_probe_after: Option<String>,
     rpm_limit: i64,
     credits_json: Option<String>,
+    user_status_json: Option<String>,
+    available_models_json: Option<String>,
+    tier_models_json: Option<String>,
     blocked_models_json: Option<String>,
     credentials_json: Option<String>,
 }
@@ -166,6 +196,14 @@ enum UpstreamRateLimitScope {
 struct UpstreamRateLimit {
     scope: UpstreamRateLimitScope,
     retry_after_secs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AccountFailureAction {
+    RateLimit(UpstreamRateLimit),
+    FatalAccountError,
+    TransientRecordOnly,
+    ReleaseOnly,
 }
 
 #[derive(Deserialize)]
@@ -248,6 +286,12 @@ struct LoginEntry {
 }
 
 #[derive(Debug)]
+struct ExistingLoginAccount {
+    id: i64,
+    normal: bool,
+}
+
+#[derive(Debug)]
 struct WindsurfLoginSuccess {
     email: String,
     name: String,
@@ -296,6 +340,11 @@ struct MessagesRequest {
     model: Option<String>,
     stream: Option<bool>,
     max_tokens: Option<u64>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<u64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
     system: Option<Value>,
     tools: Option<Value>,
     tool_choice: Option<Value>,
@@ -339,7 +388,30 @@ struct CapacitySettings {
     sticky_session_minutes: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ModelControlSettings {
+    default_model: Option<String>,
+    disabled_models: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatsQuery {
+    range: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveModelControlRequest {
+    default_model: String,
+    disabled_models: Vec<String>,
+}
+
 const RATE_LIMIT_PROBE_INTERVAL_SECS: i64 = 300;
+const DEFAULT_SYSTEM_PROMPT_MODE_SETTING: &str = "strip-identity";
+const MAX_DYNAMIC_ACCOUNT_RETRIES: i64 = 80;
+const DEFAULT_CHAT_MODEL: &str = "claude-opus-4-1";
+const DEFAULT_ADMIN_MODEL: &str = "claude-sonnet-4-6";
 
 impl Default for CapacitySettings {
     fn default() -> Self {
@@ -358,11 +430,65 @@ impl Default for CapacitySettings {
     }
 }
 
+impl BranchGate {
+    const WINDOW: StdDuration = StdDuration::from_millis(1500);
+    const WAIT_FOR_TOOL_BRANCH: StdDuration = StdDuration::from_millis(350);
+
+    async fn check(
+        &self,
+        key: Option<&str>,
+        tool_count: usize,
+        messages: &[EngineMessage],
+    ) -> BranchGateDecision {
+        let Some(key) = key.filter(|value| !value.is_empty()) else {
+            return BranchGateDecision::Allow;
+        };
+        let now = Instant::now();
+        let fingerprint = branch_message_fingerprint(messages);
+        if tool_count > 0 {
+            let mut guard = self.inner.lock().await;
+            prune_branch_gate(&mut guard, now);
+            let state = guard
+                .entry(key.to_string())
+                .or_insert_with(|| BranchGateState {
+                    recent_tool_request_at: now,
+                    fingerprints: HashSet::new(),
+                });
+            state.recent_tool_request_at = now;
+            state.fingerprints.insert(fingerprint);
+            return BranchGateDecision::Allow;
+        }
+
+        if self.has_recent_tool_branch(key, &fingerprint, now).await {
+            return BranchGateDecision::SuppressNoToolBranch;
+        }
+        tokio::time::sleep(Self::WAIT_FOR_TOOL_BRANCH).await;
+        if self
+            .has_recent_tool_branch(key, &fingerprint, Instant::now())
+            .await
+        {
+            BranchGateDecision::SuppressNoToolBranch
+        } else {
+            BranchGateDecision::Allow
+        }
+    }
+
+    async fn has_recent_tool_branch(&self, key: &str, fingerprint: &str, now: Instant) -> bool {
+        let mut guard = self.inner.lock().await;
+        prune_branch_gate(&mut guard, now);
+        guard.get(key).is_some_and(|state| {
+            now.duration_since(state.recent_tool_request_at) <= Self::WINDOW
+                && state.fingerprints.contains(fingerprint)
+        })
+    }
+}
+
+fn prune_branch_gate(items: &mut HashMap<String, BranchGateState>, now: Instant) {
+    items.retain(|_, state| now.duration_since(state.recent_tool_request_at) <= BranchGate::WINDOW);
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(env_filter).init();
-
     let args = Args::parse();
     std::fs::create_dir_all(&args.data_dir).with_context(|| {
         format!(
@@ -370,6 +496,8 @@ async fn main() -> anyhow::Result<()> {
             args.data_dir.display()
         )
     })?;
+    init_logging(&args.data_dir)?;
+    cleanup_old_logs(&args.data_dir, LOG_RETENTION_DAYS);
     let db_path = args.data_dir.join("windsurf-rs.sqlite3");
     let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
     let db = SqlitePoolOptions::new()
@@ -377,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
         .connect(&db_url)
         .await
         .with_context(|| format!("failed to open sqlite database {}", db_path.display()))?;
-    run_migrations(&db).await?;
+    run_migrations(&db, &args.data_dir).await?;
 
     let settings = settings_map(&db).await.unwrap_or_default();
     let engine = RemoteApiEngine::new(EngineConfig::from_settings(
@@ -385,13 +513,71 @@ async fn main() -> anyhow::Result<()> {
         args.data_dir.clone(),
     ));
     let (events, _) = broadcast::channel(512);
-    let state = AppState { db, engine, events };
+    let state = AppState {
+        db,
+        engine,
+        events,
+        branch_gate: BranchGate::default(),
+        data_dir: args.data_dir.clone(),
+    };
     let app = router(state, args.static_dir);
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("windsurf-rs listening on http://{}", addr);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn init_logging(data_dir: &PathBuf) -> anyhow::Result<()> {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let log_dir = data_dir.join("logs");
+    std::fs::create_dir_all(&log_dir).with_context(|| {
+        format!(
+            "failed to create log directory {}",
+            log_dir.display()
+        )
+    })?;
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "windsurf-rs.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    Box::leak(Box::new(guard));
+    fmt()
+        .with_env_filter(env_filter)
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .init();
+    tracing::info!(
+        log_dir = %log_dir.display(),
+        retention_days = LOG_RETENTION_DAYS,
+        "file logging initialized"
+    );
+    Ok(())
+}
+
+fn cleanup_old_logs(data_dir: &PathBuf, retention_days: u64) {
+    let log_dir = data_dir.join("logs");
+    let cutoff = StdDuration::from_secs(retention_days.saturating_mul(24 * 60 * 60));
+    let Ok(entries) = std::fs::read_dir(&log_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("windsurf-rs.log") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if now.duration_since(modified).is_ok_and(|age| age > cutoff) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 fn router(state: AppState, static_dir: Option<PathBuf>) -> Router {
@@ -460,6 +646,11 @@ fn router(state: AppState, static_dir: Option<PathBuf>) -> Router {
         )
         .route("/admin/requests", get(requests_list))
         .route("/admin/requests/{id}", get(request_detail))
+        .route("/admin/stats", get(admin_stats))
+        .route(
+            "/admin/models/config",
+            get(admin_models_config_get).put(admin_models_config_put),
+        )
         .route("/admin/capacity", get(capacity_get).put(capacity_put))
         .route("/admin/settings", get(settings_get).put(settings_put))
         .with_state(Arc::new(state));
@@ -477,7 +668,7 @@ fn router(state: AppState, static_dir: Option<PathBuf>) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
-async fn run_migrations(db: &SqlitePool) -> anyhow::Result<()> {
+async fn run_migrations(db: &SqlitePool, data_dir: &PathBuf) -> anyhow::Result<()> {
     let sql = include_str!("../../../migrations/0001_init.sql");
     for statement in sql.split(';') {
         let statement = statement.trim();
@@ -486,7 +677,10 @@ async fn run_migrations(db: &SqlitePool) -> anyhow::Result<()> {
         }
     }
     ensure_account_columns(db).await?;
+    ensure_trace_chunk_columns(db).await?;
     ensure_client_api_keys(db).await?;
+    ensure_admin_query_indexes(db).await?;
+    migrate_trace_payloads_to_files(db, data_dir).await?;
     cleanup_runtime_state(db).await?;
     Ok(())
 }
@@ -625,6 +819,78 @@ async fn ensure_account_model_rate_limit_columns(db: &SqlitePool) -> anyhow::Res
         sqlx::query("ALTER TABLE account_model_rate_limits ADD COLUMN probe_after TEXT")
             .execute(db)
             .await?;
+    }
+    Ok(())
+}
+
+async fn ensure_trace_chunk_columns(db: &SqlitePool) -> anyhow::Result<()> {
+    let existing_rows = sqlx::query("PRAGMA table_info(request_trace_chunks)")
+        .fetch_all(db)
+        .await?;
+    let existing: std::collections::HashSet<String> = existing_rows
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect();
+    if !existing.contains("payload_path") {
+        sqlx::query("ALTER TABLE request_trace_chunks ADD COLUMN payload_path TEXT")
+            .execute(db)
+            .await?;
+    }
+    if !existing.contains("payload_size") {
+        sqlx::query(
+            "ALTER TABLE request_trace_chunks ADD COLUMN payload_size INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(db)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn ensure_admin_query_indexes(db: &SqlitePool) -> anyhow::Result<()> {
+    for statement in [
+        "CREATE INDEX IF NOT EXISTS idx_request_traces_started_at ON request_traces(started_at)",
+        "CREATE INDEX IF NOT EXISTS idx_login_jobs_created_at ON login_jobs(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_request_trace_chunks_trace_id ON request_trace_chunks(trace_id)",
+        "CREATE INDEX IF NOT EXISTS idx_login_job_events_job_id_id ON login_job_events(job_id, id)",
+    ] {
+        sqlx::query(statement).execute(db).await?;
+    }
+    Ok(())
+}
+
+async fn migrate_trace_payloads_to_files(
+    db: &SqlitePool,
+    data_dir: &PathBuf,
+) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT id, trace_id, payload FROM request_trace_chunks
+         WHERE payload_path IS NULL AND length(payload) > ?",
+    )
+    .bind(i64::try_from(TRACE_PAYLOAD_PREVIEW_CHARS).unwrap_or(1200))
+    .fetch_all(db)
+    .await?;
+    let total = rows.len();
+    for row in rows {
+        let id = row.get::<i64, _>("id");
+        let trace_id = row.get::<String, _>("trace_id");
+        let payload = row.get::<String, _>("payload");
+        let payload_size = i64::try_from(payload.len()).unwrap_or(i64::MAX);
+        let payload_path = write_trace_payload(data_dir, &trace_id, &payload).await?;
+        let payload_preview = trace_payload_preview(&payload);
+        sqlx::query(
+            "UPDATE request_trace_chunks
+             SET payload=?, payload_path=?, payload_size=?
+             WHERE id=?",
+        )
+        .bind(payload_preview)
+        .bind(payload_path)
+        .bind(payload_size)
+        .bind(id)
+        .execute(db)
+        .await?;
+    }
+    if total > 0 {
+        tracing::info!(count = total, "trace payloads migrated to files");
     }
     Ok(())
 }
@@ -770,7 +1036,18 @@ async fn models(
     if let Err(resp) = require_client_api_key(&state.db, &headers, Some(&query)).await {
         return resp;
     }
-    let models = model_catalog(&state.db).await;
+    let controls = model_control_settings(&state.db).await.unwrap_or_default();
+    let disabled = disabled_model_set(&controls);
+    let models = model_catalog(&state.db)
+        .await
+        .into_iter()
+        .filter(|model| {
+            let Some(id) = model.get("id").and_then(Value::as_str) else {
+                return false;
+            };
+            !disabled.contains(&model_alias(id))
+        })
+        .collect::<Vec<_>>();
     Json(json!({
         "object": "list",
         "data": models.into_iter().map(|model| json!({
@@ -795,18 +1072,30 @@ async fn messages(
     }
     let started_at = Instant::now();
     let trace_id = Uuid::new_v4().to_string();
-    let model = payload
-        .model
-        .clone()
-        .unwrap_or_else(|| "claude-opus-4-1".to_string());
+    let controls = model_control_settings(&state.db).await.unwrap_or_default();
+    let model = payload.model.clone().unwrap_or_else(|| {
+        controls
+            .default_model
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_CHAT_MODEL.to_string())
+    });
     let stream_requested = payload.stream.unwrap_or(false);
     let debug_summary = message_debug_summary(&payload);
     let request_snapshot = sanitized_message_request(&payload, &debug_summary);
     if let Err(err) = create_trace(&state.db, &trace_id, Some(&model), stream_requested).await {
         tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages trace create failed");
     }
+    if disabled_model_set(&controls).contains(&model_alias(&model)) {
+        let message = "这个模型已停用，请选择其他模型";
+        if let Err(err) = finish_trace(&state.db, &trace_id, "error", None, Some(message)).await {
+            tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages trace finish failed");
+        }
+        return error(StatusCode::BAD_REQUEST, "model_disabled", message);
+    }
     if let Err(err) = add_trace_chunk(
         &state.db,
+        &state.data_dir,
         &trace_id,
         "client_request_summary",
         &request_snapshot,
@@ -840,10 +1129,132 @@ async fn messages(
         input_chars = debug_summary.input_chars,
         "messages request summary"
     );
+    if is_probe_request(&payload) {
+        if let Err(err) = finish_trace(&state.db, &trace_id, "ok", Some("probe"), None).await {
+            tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages probe trace finish failed");
+        }
+        tracing::info!(trace_id = %trace_id, model = %model, "messages probe intercepted");
+        return send_probe_response(&model);
+    }
+    let mut engine_messages = messages_from_request(&payload);
+    if engine_messages.is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "messages is required and must be a non-empty array",
+        );
+    }
+    let caller_environment = extract_caller_environment(&engine_messages);
+    let (mut engine_tools, truncated_docs) = sanitize_tools(payload.tools.as_ref());
+    let risk = detect_tool_description_risk_client(&headers, &engine_tools);
+    let claude_code_client = is_claude_code_client(&headers);
+    if claude_code_client || risk.risky {
+        replace_system_prompt_for_tool_description_risk(&mut engine_messages);
+        shorten_tool_descriptions_for_risk_client(&mut engine_tools);
+        tracing::info!(
+            trace_id = %trace_id,
+            reason = %if risk.risky { risk.reason.as_str() } else { "header:claude-code-legacy" },
+            tool_count = engine_tools.len(),
+            "messages risk client normalized"
+        );
+    }
+    if claude_code_client || risk.risky {
+        let branch_key = branch_gate_key(caller_key.as_deref(), &model, &engine_messages);
+        match state
+            .branch_gate
+            .check(
+                branch_key.as_deref(),
+                debug_summary.tool_count,
+                &engine_messages,
+            )
+            .await
+        {
+            BranchGateDecision::Allow => {}
+            BranchGateDecision::SuppressNoToolBranch => {
+                tracing::info!(
+                    trace_id = %trace_id,
+                    caller_key_hash = caller_key_hash.as_deref().unwrap_or("none"),
+                    tool_count = debug_summary.tool_count,
+                    "messages no-tool side branch suppressed"
+                );
+                if let Err(err) = finish_trace(
+                    &state.db,
+                    &trace_id,
+                    "ok",
+                    Some("suppressed_no_tool_branch"),
+                    None,
+                )
+                .await
+                {
+                    tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages trace finish failed");
+                }
+                if stream_requested {
+                    return empty_anthropic_stream_response(trace_id, model);
+                }
+                return empty_anthropic_message_response(trace_id, model);
+            }
+        }
+    }
+    let tool_choice = sanitize_tool_choice(payload.tool_choice.as_ref());
+    let isolation = match isolate_tool_names(
+        engine_tools,
+        engine_messages,
+        tool_choice,
+        truncated_docs,
+        DEFAULT_ANONYMOUS_TOOL_NAME_PREFIX,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_tool_name_prefix",
+                &err.to_string(),
+            );
+        }
+    };
+    let tool_degrade = degrade_tool_choice_for_upstream(
+        isolation.tool_choice,
+        isolation.messages,
+        &isolation.to_client_name,
+    );
+    let engine_messages = if claude_code_client || risk.risky {
+        tool_degrade.messages
+    } else {
+        inject_tool_docs_into_system(tool_degrade.messages, &isolation.truncated_docs)
+    };
+    let engine_tools = isolation.tools;
+    let tool_name_map = isolation.to_client_name;
+    let tool_choice = tool_degrade.tool_choice;
+    let sampling_params = sampling_params_from_request(&payload);
+    let estimated_input_tokens = estimate_input_tokens_from_messages(&engine_messages);
+    let engine_session_key = caller_key
+        .clone()
+        .unwrap_or_else(|| format!("trace:{trace_id}"));
+    let system_prompt_mode = system_prompt_mode_setting(&state.db).await;
+    tracing::debug!(
+        trace_id = %trace_id,
+        engine_message_count = engine_messages.len(),
+        estimated_input_tokens,
+        tool_count = engine_tools.len(),
+        caller_environment = %caller_environment.as_deref().unwrap_or(""),
+        system_prompt_mode = %system_prompt_mode.as_str(),
+        "messages converted for upstream"
+    );
     let capacity = capacity_settings(&state.db).await.unwrap_or_default();
     let scheduler = AccountScheduler::new(state.db.clone(), capacity.clone(), state.events.clone());
-    let mut lease = match scheduler.acquire(&model, caller_key.clone()).await {
-        Ok(lease) => lease,
+    let engine_model = resolve_engine_model(&model);
+    log_model_resolution(&trace_id, &model, &engine_model);
+    let (mut lease, mut engine_account) = match scheduler
+        .acquire_preflighted(
+            &state.engine,
+            &trace_id,
+            &model,
+            &engine_model,
+            caller_key.clone(),
+        )
+        .await
+    {
+        Ok(value) => value,
         Err(AcquireError::TemporarilyUnavailable {
             retry_after_secs,
             reason,
@@ -923,6 +1334,7 @@ async fn messages(
     }
     if let Err(err) = add_trace_chunk(
         &state.db,
+        &state.data_dir,
         &trace_id,
         "account_acquired",
         &json!({
@@ -937,33 +1349,35 @@ async fn messages(
     {
         tracing::debug!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages trace chunk write failed");
     }
-    let engine_messages = messages_from_request(&payload);
-    let estimated_input_tokens = estimate_input_tokens_from_messages(&engine_messages);
-    let engine_session_key = caller_key
-        .clone()
-        .unwrap_or_else(|| format!("trace:{trace_id}"));
-    tracing::debug!(
-        trace_id = %trace_id,
-        engine_message_count = engine_messages.len(),
-        estimated_input_tokens,
-        "messages converted for upstream"
-    );
-
     if stream_requested {
         let db = state.db.clone();
+        let data_dir_for_stream = state.data_dir.clone();
         let capacity_for_stream = capacity.clone();
         let events_for_stream = state.events.clone();
         let engine = state.engine.clone();
-        let engine_account = EngineAccount {
-            api_key: lease.api_key.clone(),
-            jwt_token: lease.jwt_token.clone(),
-            proxy_url: proxy_url_for_account(&state.db, lease.account_id).await,
-        };
-        let engine_model = resolve_engine_model(&model);
         let trace = trace_id.clone();
         let model_for_stream = model.clone();
+        let engine_tools_for_stream = engine_tools.clone();
+        let tool_choice_for_stream = tool_choice.clone();
+        let sampling_for_stream = sampling_params.clone();
+        let tool_name_map_for_stream = tool_name_map.clone();
+        let engine_model_for_stream = engine_model.clone();
+        let engine_messages_for_stream = engine_messages.clone();
+        let engine_session_key_for_stream = engine_session_key.clone();
+        let caller_key_for_stream = caller_key.clone();
+        let system_prompt_mode_for_stream = system_prompt_mode;
+        let caller_environment_for_stream = caller_environment.clone();
         let s = stream! {
             let stream_started_at = Instant::now();
+            let mut lease = lease;
+            let mut engine_account = engine_account;
+            let mut retry_on_account_failure = retry_budget_for_account_pool(
+                &db,
+                &capacity_for_stream,
+                &trace,
+                "stream",
+            )
+            .await;
             let start = json!({
                 "type": "message_start",
                 "message": {
@@ -978,238 +1392,598 @@ async fn messages(
                 }
             });
             tracing::info!(trace_id = %trace, model = %model_for_stream, estimated_input_tokens, "messages stream start");
-            yield Ok::<Event, std::convert::Infallible>(Event::default().data(start.to_string()));
-            match engine
+            yield Ok::<Event, std::convert::Infallible>(anthropic_sse_event("message_start", start));
+            'stream_retry: loop {
+                match engine
+                    .messages_stream(
+                        Some(trace.clone()),
+                        Some(engine_session_key_for_stream.clone()),
+                        engine_account.clone(),
+                        engine_model_for_stream.clone(),
+                        engine_messages_for_stream.clone(),
+                        engine_tools_for_stream.clone(),
+                        tool_choice_for_stream.clone(),
+                        sampling_for_stream.clone(),
+                        system_prompt_mode_for_stream,
+                        caller_environment_for_stream.clone(),
+                    )
+                    .await
+                {
+                    Ok(upstream) => {
+                        use futures_util::StreamExt;
+                        futures_util::pin_mut!(upstream);
+                        let mut input_tokens = estimated_input_tokens;
+                        let mut cached_input_tokens = 0_u64;
+                        let mut output_tokens = 0_u64;
+                        let mut chunk_count = 0_u64;
+                        let mut first_chunk_logged = false;
+                        let mut active_block: Option<(String, u64)> = None;
+                        let mut next_block_index = 0_u64;
+                        let mut active_tool_call_id: Option<String> = None;
+                        let mut has_tool_calls = false;
+                        let mut stop_reason = "end_turn".to_string();
+                        while let Some(item) = upstream.next().await {
+                            match item {
+                                Ok(chunk) => {
+                                    chunk_count += 1;
+                                    if !first_chunk_logged {
+                                        first_chunk_logged = true;
+                                        tracing::debug!(
+                                            trace_id = %trace,
+                                            first_chunk_ms = stream_started_at.elapsed().as_millis() as u64,
+                                            "messages stream first chunk"
+                                        );
+                                    }
+                                    if let Some(tokens) = chunk.prompt_tokens {
+                                        input_tokens = tokens;
+                                    }
+                                    if let Some(tokens) = chunk.cached_input_tokens {
+                                        cached_input_tokens = tokens;
+                                    }
+                                    if !chunk.text.is_empty() {
+                                        output_tokens += estimate_local_tokens(&chunk.text);
+                                    }
+                                    if !chunk.reasoning.is_empty() {
+                                        output_tokens += estimate_local_tokens(&chunk.reasoning);
+                                    }
+                                    if let Some(tokens) = chunk.completion_tokens {
+                                        output_tokens = tokens;
+                                    }
+                                    if let Some(reason) = chunk.stop_reason.as_deref() {
+                                        stop_reason = reason.to_string();
+                                    }
+                                    if !chunk.reasoning.is_empty() {
+                                        let (index, events) = switch_anthropic_block(&mut active_block, &mut next_block_index, "text", json!({"type":"text","text":""}));
+                                        for event in events {
+                                            yield Ok(event);
+                                        }
+                                        let delta = anthropic_text_delta(index, chunk.reasoning);
+                                        if let Err(err) = add_trace_chunk(
+                                            &db,
+                                            &data_dir_for_stream,
+                                            &trace,
+                                            "downstream_event",
+                                            &delta,
+                                        )
+                                        .await
+                                        {
+                                            tracing::debug!(trace_id = %trace, error = %redact_log_text(&err.to_string()), "messages trace chunk write failed");
+                                        }
+                                        yield Ok(anthropic_sse_event("content_block_delta", delta));
+                                    }
+                                    if !chunk.text.is_empty() {
+                                        let (index, events) = switch_anthropic_block(&mut active_block, &mut next_block_index, "text", json!({"type":"text","text":""}));
+                                        for event in events {
+                                            yield Ok(event);
+                                        }
+                                        let delta = anthropic_text_delta(index, chunk.text);
+                                        if let Err(err) = add_trace_chunk(
+                                            &db,
+                                            &data_dir_for_stream,
+                                            &trace,
+                                            "downstream_event",
+                                            &delta,
+                                        )
+                                        .await
+                                        {
+                                            tracing::debug!(trace_id = %trace, error = %redact_log_text(&err.to_string()), "messages trace chunk write failed");
+                                        }
+                                        yield Ok(anthropic_sse_event("content_block_delta", delta));
+                                    }
+                                    if chunk.tool_call_id.is_some() || chunk.tool_call_name.is_some() || chunk.tool_call_args.is_some() {
+                                        has_tool_calls = true;
+                                        let tool_call_id = chunk
+                                            .tool_call_id
+                                            .clone()
+                                            .or_else(|| active_tool_call_id.clone())
+                                            .unwrap_or_else(|| format!("toolu_{}", Uuid::new_v4().simple()));
+                                        active_tool_call_id = Some(tool_call_id.clone());
+                                        let upstream_name = chunk.tool_call_name.as_deref().unwrap_or("unknown");
+                                        let client_name = restore_tool_name(upstream_name, &tool_name_map_for_stream);
+                                        let (index, events) = switch_anthropic_block(
+                                            &mut active_block,
+                                            &mut next_block_index,
+                                            "tool_use",
+                                            json!({"type":"tool_use","id":tool_call_id,"name":client_name,"input":{}}),
+                                        );
+                                        for event in events {
+                                            yield Ok(event);
+                                        }
+                                        if let Some(args) = chunk.tool_call_args.as_deref().filter(|value| !value.is_empty()) {
+                                            yield Ok(anthropic_sse_event("content_block_delta", json!({
+                                                "type": "content_block_delta",
+                                                "index": index,
+                                                "delta": { "type": "input_json_delta", "partial_json": args }
+                                            })));
+                                        }
+                                    }
+                                    tracing::debug!(
+                                        trace_id = %trace,
+                                        chunk_count,
+                                        output_tokens,
+                                        "messages stream downstream chunk"
+                                    );
+                                }
+                                Err(err) => {
+                                    let error_summary = redact_log_text(&err.to_string());
+                                    tracing::error!(
+                                        trace_id = %trace,
+                                        error = %error_summary,
+                                        elapsed_ms = stream_started_at.elapsed().as_millis() as u64,
+                                        chunk_count,
+                                        "messages stream upstream error"
+                                    );
+                                    let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone(), events_for_stream.clone());
+                                    if chunk_count == 0
+                                        && is_retryable_before_output_error(&err.to_string())
+                                        && retry_on_account_failure > 0
+                                    {
+                                        retry_on_account_failure -= 1;
+                                        if let Err(mark_err) = scheduler.mark_failure(&mut lease, &err.to_string()).await {
+                                            tracing::warn!(trace_id = %trace, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
+                                            let error_kind = anthropic_error_type_for_upstream(&mark_err.to_string());
+                                            yield Ok(anthropic_sse_event("error", json!({"type":"error","error":{"type":error_kind,"message":mark_err.to_string()}})));
+                                            return;
+                                        }
+                                        match scheduler
+                                            .acquire_preflighted(
+                                                &engine,
+                                                &trace,
+                                                &model_for_stream,
+                                                &engine_model_for_stream,
+                                                caller_key_for_stream.clone(),
+                                            )
+                                            .await
+                                        {
+                                            Ok((retry_lease, retry_engine_account)) => {
+                                                lease = retry_lease;
+                                                engine_account = retry_engine_account;
+                                                if let Err(bind_err) = bind_trace_account(&db, &trace, lease.account_id).await {
+                                                    tracing::warn!(trace_id = %trace, account_id = lease.account_id, error = %redact_log_text(&bind_err.to_string()), "messages trace account bind failed");
+                                                }
+                                                if let Err(chunk_err) = add_trace_chunk(
+                                                    &db,
+                                                    &data_dir_for_stream,
+                                                    &trace,
+                                                    "account_acquired",
+                                                    &json!({
+                                                        "accountId": lease.account_id,
+                                                        "email": lease.email,
+                                                        "model": model_for_stream,
+                                                        "sticky": lease.sticky,
+                                                        "reservationId": lease.reservation_id,
+                                                        "retryReason": "stream_rate_limit"
+                                                    }),
+                                                )
+                                                .await
+                                                {
+                                                    tracing::debug!(trace_id = %trace, error = %redact_log_text(&chunk_err.to_string()), "messages trace chunk write failed");
+                                                }
+                                                tracing::info!(
+                                                    trace_id = %trace,
+                                                    account_id = lease.account_id,
+                                                    remaining_retries = retry_on_account_failure,
+                                                    "messages stream retryable error switched account"
+                                                );
+                                                continue 'stream_retry;
+                                            }
+                                            Err(acquire_err) => {
+                                                let message = acquire_error_message(&acquire_err);
+                                                if let Err(trace_err) = finish_trace(&db, &trace, "error", None, Some(&message)).await {
+                                                    tracing::warn!(trace_id = %trace, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+                                                }
+                                                yield Ok(anthropic_sse_event("error", json!({"type":"error","error":{"type":"rate_limit_error","message":message}})));
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    if let Err(trace_err) = finish_trace(&db, &trace, "error", None, Some(&err.to_string())).await {
+                                        tracing::warn!(trace_id = %trace, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+                                    }
+                                    if let Err(mark_err) = scheduler.mark_failure(&mut lease, &err.to_string()).await {
+                                        tracing::warn!(trace_id = %trace, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
+                                    }
+                                    let error_kind = anthropic_error_type_for_upstream(&err.to_string());
+                                    yield Ok(anthropic_sse_event("error", json!({"type":"error","error":{"type":error_kind,"message":err.to_string()}})));
+                                    return;
+                                }
+                            }
+                        }
+                        if let Some((_, index)) = active_block.take() {
+                            yield Ok(anthropic_sse_event("content_block_stop", json!({"type": "content_block_stop", "index": index})));
+                        }
+                        let final_stop_reason = if has_tool_calls { "tool_use" } else { stop_reason.as_str() };
+                        let stop = json!({
+                            "type": "message_delta",
+                            "delta": {"stop_reason": final_stop_reason, "stop_sequence": null},
+                            "usage": {
+                                "input_tokens": input_tokens + cached_input_tokens,
+                                "output_tokens": output_tokens,
+                                "cache_creation_input_tokens": 0,
+                                "cache_read_input_tokens": cached_input_tokens,
+                                "service_tier": "standard"
+                            }
+                        });
+                        yield Ok(anthropic_sse_event("message_delta", stop));
+                        yield Ok(anthropic_sse_event("message_stop", json!({"type": "message_stop"})));
+                        let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone(), events_for_stream.clone());
+                        if let Err(mark_err) = scheduler.mark_success(&mut lease).await {
+                            tracing::warn!(trace_id = %trace, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark success failed");
+                        }
+                        if let Err(trace_err) = finish_trace(&db, &trace, "ok", Some(final_stop_reason), None).await {
+                            tracing::warn!(trace_id = %trace, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+                        }
+                        tracing::info!(
+                            trace_id = %trace,
+                            elapsed_ms = stream_started_at.elapsed().as_millis() as u64,
+                            chunk_count,
+                            input_tokens,
+                            output_tokens,
+                            "messages stream complete"
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        let error_summary = redact_log_text(&err.to_string());
+                        tracing::error!(
+                            trace_id = %trace,
+                            error = %error_summary,
+                            elapsed_ms = stream_started_at.elapsed().as_millis() as u64,
+                            "messages stream open upstream failed"
+                        );
+                        let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone(), events_for_stream.clone());
+                        if is_retryable_before_output_error(&err.to_string()) && retry_on_account_failure > 0 {
+                            retry_on_account_failure -= 1;
+                            if let Err(mark_err) = scheduler.mark_failure(&mut lease, &err.to_string()).await {
+                                tracing::warn!(trace_id = %trace, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
+                                let error_kind = anthropic_error_type_for_upstream(&mark_err.to_string());
+                                yield Ok(anthropic_sse_event("error", json!({"type":"error","error":{"type":error_kind,"message":mark_err.to_string()}})));
+                                return;
+                            }
+                            match scheduler
+                                .acquire_preflighted(
+                                    &engine,
+                                    &trace,
+                                    &model_for_stream,
+                                    &engine_model_for_stream,
+                                    caller_key_for_stream.clone(),
+                                )
+                                .await
+                            {
+                                Ok((retry_lease, retry_engine_account)) => {
+                                    lease = retry_lease;
+                                    engine_account = retry_engine_account;
+                                    if let Err(bind_err) = bind_trace_account(&db, &trace, lease.account_id).await {
+                                        tracing::warn!(trace_id = %trace, account_id = lease.account_id, error = %redact_log_text(&bind_err.to_string()), "messages trace account bind failed");
+                                    }
+                                    tracing::info!(
+                                        trace_id = %trace,
+                                        account_id = lease.account_id,
+                                        remaining_retries = retry_on_account_failure,
+                                        "messages stream open retryable error switched account"
+                                    );
+                                    continue 'stream_retry;
+                                }
+                                Err(acquire_err) => {
+                                    let message = acquire_error_message(&acquire_err);
+                                    if let Err(trace_err) = finish_trace(&db, &trace, "error", None, Some(&message)).await {
+                                        tracing::warn!(trace_id = %trace, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+                                    }
+                                    yield Ok(anthropic_sse_event("error", json!({"type":"error","error":{"type":"rate_limit_error","message":message}})));
+                                    return;
+                                }
+                            }
+                        }
+                        if let Err(trace_err) = finish_trace(&db, &trace, "error", None, Some(&err.to_string())).await {
+                            tracing::warn!(trace_id = %trace, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+                        }
+                        if let Err(mark_err) = scheduler.mark_failure(&mut lease, &err.to_string()).await {
+                            tracing::warn!(trace_id = %trace, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
+                        }
+                        let error_kind = anthropic_error_type_for_upstream(&err.to_string());
+                        yield Ok(anthropic_sse_event("error", json!({"type":"error","error":{"type":error_kind,"message":err.to_string()}})));
+                        return;
+                    }
+                }
+            }
+        };
+        Sse::new(s).keep_alive(KeepAlive::default()).into_response()
+    } else {
+        let engine = state.engine.clone();
+        let mut retry_on_account_failure =
+            retry_budget_for_account_pool(&state.db, &capacity, &trace_id, "nonstream").await;
+        let mut input_tokens;
+        let mut cached_input_tokens;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut reasoning_signature = String::new();
+        let mut tool_calls: HashMap<String, (String, String)> = HashMap::new();
+        let mut generated_tool_index;
+        let mut active_tool_call_id: Option<String>;
+        let mut output_tokens;
+        let mut stop_reason: String;
+        let mut chunk_count;
+        'request_retry: loop {
+            input_tokens = estimated_input_tokens;
+            cached_input_tokens = 0;
+            text.clear();
+            reasoning.clear();
+            reasoning_signature.clear();
+            tool_calls.clear();
+            generated_tool_index = 0;
+            active_tool_call_id = None;
+            output_tokens = 0;
+            stop_reason = "end_turn".to_string();
+            chunk_count = 0;
+            let stream_result = engine
                 .messages_stream(
-                    Some(trace.clone()),
-                    Some(engine_session_key),
-                    engine_account,
-                    engine_model,
-                    engine_messages,
+                    Some(trace_id.clone()),
+                    Some(engine_session_key.clone()),
+                    engine_account.clone(),
+                    engine_model.clone(),
+                    engine_messages.clone(),
+                    engine_tools.clone(),
+                    tool_choice.clone(),
+                    sampling_params.clone(),
+                    system_prompt_mode,
+                    caller_environment.clone(),
                 )
-                .await
-            {
+                .await;
+            match stream_result {
                 Ok(upstream) => {
                     use futures_util::StreamExt;
                     futures_util::pin_mut!(upstream);
-                    let mut input_tokens = estimated_input_tokens as i64;
-                    let mut output_tokens = 0_i64;
-                    let mut chunk_count = 0_u64;
-                    let mut first_chunk_logged = false;
-                    let mut content_block_started = false;
                     while let Some(item) = upstream.next().await {
                         match item {
                             Ok(chunk) => {
-                                if !content_block_started {
-                                    content_block_started = true;
-                                    let content_start = json!({
-                                        "type": "content_block_start",
-                                        "index": 0,
-                                        "content_block": { "type": "text", "text": "" }
-                                    });
-                                    if let Err(err) = add_trace_chunk(&db, &trace, "downstream_event", &content_start).await {
-                                        tracing::debug!(trace_id = %trace, error = %redact_log_text(&err.to_string()), "messages trace chunk write failed");
-                                    }
-                                    yield Ok(Event::default().data(content_start.to_string()));
-                                }
                                 chunk_count += 1;
-                                if !first_chunk_logged {
-                                    first_chunk_logged = true;
-                    tracing::debug!(
-                        trace_id = %trace,
-                        first_chunk_ms = stream_started_at.elapsed().as_millis() as u64,
-                        "messages stream first chunk"
-                                    );
-                                }
                                 if let Some(tokens) = chunk.prompt_tokens {
-                                    input_tokens = tokens as i64;
+                                    input_tokens = tokens;
                                 }
-                                output_tokens += (chunk.text.chars().count() as i64 / 4).max(1);
+                                if let Some(tokens) = chunk.cached_input_tokens {
+                                    cached_input_tokens = tokens;
+                                }
+                                if !chunk.text.is_empty() {
+                                    output_tokens += estimate_local_tokens(&chunk.text);
+                                    text.push_str(&chunk.text);
+                                }
+                                if !chunk.reasoning.is_empty() {
+                                    output_tokens += estimate_local_tokens(&chunk.reasoning);
+                                    reasoning.push_str(&chunk.reasoning);
+                                }
+                                if !chunk.reasoning_signature.is_empty() {
+                                    reasoning_signature.push_str(&chunk.reasoning_signature);
+                                }
                                 if let Some(tokens) = chunk.completion_tokens {
-                                    output_tokens = tokens as i64;
+                                    output_tokens = tokens;
                                 }
-                                let delta = json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": chunk.text}});
-                                tracing::debug!(
-                                    trace_id = %trace,
-                                    chunk_count,
-                                    text_chars = delta.pointer("/delta/text").and_then(|value| value.as_str()).map(|value| value.chars().count()).unwrap_or(0),
-                                    output_tokens,
-                                    "messages stream downstream chunk"
-                                );
-                                if let Err(err) = add_trace_chunk(&db, &trace, "downstream_event", &delta).await {
-                                    tracing::debug!(trace_id = %trace, error = %redact_log_text(&err.to_string()), "messages trace chunk write failed");
+                                if let Some(reason) = chunk.stop_reason {
+                                    stop_reason = reason;
                                 }
-                                yield Ok(Event::default().data(delta.to_string()));
+                                if chunk.tool_call_id.is_some()
+                                    || chunk.tool_call_name.is_some()
+                                    || chunk.tool_call_args.is_some()
+                                {
+                                    let id = chunk
+                                        .tool_call_id
+                                        .or_else(|| active_tool_call_id.clone())
+                                        .unwrap_or_else(|| {
+                                            generated_tool_index += 1;
+                                            format!("toolu_{}", generated_tool_index)
+                                        });
+                                    active_tool_call_id = Some(id.clone());
+                                    let entry = tool_calls.entry(id).or_insert_with(|| {
+                                        (
+                                            chunk
+                                                .tool_call_name
+                                                .unwrap_or_else(|| "unknown".to_string()),
+                                            String::new(),
+                                        )
+                                    });
+                                    if let Some(args) = chunk.tool_call_args.as_deref() {
+                                        entry.1.push_str(args);
+                                    }
+                                }
                             }
                             Err(err) => {
                                 let error_summary = redact_log_text(&err.to_string());
                                 tracing::error!(
-                                    trace_id = %trace,
+                                    trace_id = %trace_id,
                                     error = %error_summary,
-                                    elapsed_ms = stream_started_at.elapsed().as_millis() as u64,
+                                    elapsed_ms = started_at.elapsed().as_millis() as u64,
                                     chunk_count,
-                                    "messages stream upstream error"
+                                    "messages nonstream upstream error"
                                 );
-                            if let Err(trace_err) = finish_trace(&db, &trace, "error", None, Some(&err.to_string())).await {
-                                tracing::warn!(trace_id = %trace, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
-                            }
-                            let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone(), events_for_stream.clone());
-                            if let Err(mark_err) = scheduler.mark_failure(&mut lease, &err.to_string()).await {
-                                    tracing::warn!(trace_id = %trace, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
+                                if chunk_count == 0
+                                    && is_retryable_before_output_error(&err.to_string())
+                                    && retry_on_account_failure > 0
+                                {
+                                    retry_on_account_failure -= 1;
+                                    if let Err(mark_err) =
+                                        scheduler.mark_failure(&mut lease, &err.to_string()).await
+                                    {
+                                        tracing::warn!(trace_id = %trace_id, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
+                                        return error(
+                                            StatusCode::INTERNAL_SERVER_ERROR,
+                                            "scheduler_error",
+                                            &mark_err.to_string(),
+                                        );
+                                    }
+                                    match scheduler
+                                        .acquire_preflighted(
+                                            &engine,
+                                            &trace_id,
+                                            &model,
+                                            &engine_model,
+                                            caller_key.clone(),
+                                        )
+                                        .await
+                                    {
+                                        Ok((retry_lease, retry_engine_account)) => {
+                                            lease = retry_lease;
+                                            engine_account = retry_engine_account;
+                                            if let Err(bind_err) = bind_trace_account(
+                                                &state.db,
+                                                &trace_id,
+                                                lease.account_id,
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!(trace_id = %trace_id, account_id = lease.account_id, error = %redact_log_text(&bind_err.to_string()), "messages trace account bind failed");
+                                            }
+                                            tracing::info!(
+                                                trace_id = %trace_id,
+                                                account_id = lease.account_id,
+                                                remaining_retries = retry_on_account_failure,
+                                                "messages nonstream retryable error switched account"
+                                            );
+                                            continue 'request_retry;
+                                        }
+                                        Err(acquire_err) => {
+                                            let message = acquire_error_message(&acquire_err);
+                                            if let Err(trace_err) = finish_trace(
+                                                &state.db,
+                                                &trace_id,
+                                                "error",
+                                                None,
+                                                Some(&message),
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+                                            }
+                                            return acquire_error_response(acquire_err);
+                                        }
+                                    }
                                 }
-                            let error_kind = anthropic_error_type_for_upstream(&err.to_string());
-                            yield Ok(Event::default().data(json!({"type":"error","error":{"type":error_kind,"message":err.to_string()}}).to_string()));
-                                return;
+                                if let Err(mark_err) =
+                                    scheduler.mark_failure(&mut lease, &err.to_string()).await
+                                {
+                                    tracing::warn!(trace_id = %trace_id, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
+                                }
+                                if let Err(trace_err) = finish_trace(
+                                    &state.db,
+                                    &trace_id,
+                                    "error",
+                                    None,
+                                    Some(&err.to_string()),
+                                )
+                                .await
+                                {
+                                    tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+                                }
+                                return upstream_messages_error_response(&err.to_string());
                             }
                         }
                     }
-                    if content_block_started {
-                        yield Ok(Event::default().data(json!({"type": "content_block_stop", "index": 0}).to_string()));
-                    }
-                    let stop = json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}});
-                    yield Ok(Event::default().data(stop.to_string()));
-                    yield Ok(Event::default().data(json!({"type": "message_stop"}).to_string()));
-                    let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone(), events_for_stream.clone());
-                    if let Err(mark_err) = scheduler.mark_success(&mut lease).await {
-                        tracing::warn!(trace_id = %trace, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark success failed");
-                    }
-                    if let Err(trace_err) = finish_trace(&db, &trace, "ok", Some("end_turn"), None).await {
-                        tracing::warn!(trace_id = %trace, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
-                    }
-                    tracing::info!(
-                        trace_id = %trace,
-                        elapsed_ms = stream_started_at.elapsed().as_millis() as u64,
-                        chunk_count,
-                        input_tokens,
-                        output_tokens,
-                        "messages stream complete"
-                    );
                 }
                 Err(err) => {
                     let error_summary = redact_log_text(&err.to_string());
                     tracing::error!(
-                        trace_id = %trace,
+                        trace_id = %trace_id,
                         error = %error_summary,
-                        elapsed_ms = stream_started_at.elapsed().as_millis() as u64,
-                        "messages stream open upstream failed"
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "messages nonstream open upstream failed"
                     );
-                    if let Err(trace_err) = finish_trace(&db, &trace, "error", None, Some(&err.to_string())).await {
-                        tracing::warn!(trace_id = %trace, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
+                    if let Err(mark_err) =
+                        scheduler.mark_failure(&mut lease, &err.to_string()).await
+                    {
+                        tracing::warn!(trace_id = %trace_id, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
                     }
-                    let scheduler = AccountScheduler::new(db.clone(), capacity_for_stream.clone(), events_for_stream.clone());
-                    if let Err(mark_err) = scheduler.mark_failure(&mut lease, &err.to_string()).await {
-                        tracing::warn!(trace_id = %trace, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
-                    }
-                    let error_kind = anthropic_error_type_for_upstream(&err.to_string());
-                    yield Ok(Event::default().data(json!({"type":"error","error":{"type":error_kind,"message":err.to_string()}}).to_string()));
-                }
-            }
-        };
-        Sse::new(s).into_response()
-    } else {
-        let engine = state.engine.clone();
-        let engine_account = EngineAccount {
-            api_key: lease.api_key.clone(),
-            jwt_token: lease.jwt_token.clone(),
-            proxy_url: proxy_url_for_account(&state.db, lease.account_id).await,
-        };
-        let engine_model = resolve_engine_model(&model);
-        let mut input_tokens = estimated_input_tokens;
-        let mut text = String::new();
-        let mut chunk_count = 0_u64;
-        match engine
-            .messages_stream(
-                Some(trace_id.clone()),
-                Some(engine_session_key),
-                engine_account,
-                engine_model,
-                engine_messages,
-            )
-            .await
-        {
-            Ok(upstream) => {
-                use futures_util::StreamExt;
-                futures_util::pin_mut!(upstream);
-                while let Some(item) = upstream.next().await {
-                    match item {
-                        Ok(chunk) => {
-                            chunk_count += 1;
-                            if let Some(tokens) = chunk.prompt_tokens {
-                                input_tokens = tokens;
-                            }
-                            if !chunk.text.is_empty() {
-                                text.push_str(&chunk.text);
-                            }
-                        }
-                        Err(err) => {
-                            let error_summary = redact_log_text(&err.to_string());
-                            tracing::error!(
-                                trace_id = %trace_id,
-                                error = %error_summary,
-                                elapsed_ms = started_at.elapsed().as_millis() as u64,
-                                chunk_count,
-                                "messages nonstream upstream error"
-                            );
-                            if let Err(mark_err) =
-                                scheduler.mark_failure(&mut lease, &err.to_string()).await
-                            {
-                                tracing::warn!(trace_id = %trace_id, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
-                            }
-                            if let Err(trace_err) = finish_trace(
-                                &state.db,
-                                &trace_id,
-                                "error",
-                                None,
-                                Some(&err.to_string()),
-                            )
+                    if let Err(trace_err) =
+                        finish_trace(&state.db, &trace_id, "error", None, Some(&err.to_string()))
                             .await
-                            {
-                                tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
-                            }
-                            return upstream_messages_error_response(&err.to_string());
-                        }
+                    {
+                        tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
                     }
+                    return upstream_messages_error_response(&err.to_string());
                 }
             }
-            Err(err) => {
-                let error_summary = redact_log_text(&err.to_string());
-                tracing::error!(
-                    trace_id = %trace_id,
-                    error = %error_summary,
-                    elapsed_ms = started_at.elapsed().as_millis() as u64,
-                    "messages nonstream open upstream failed"
-                );
-                if let Err(mark_err) = scheduler.mark_failure(&mut lease, &err.to_string()).await {
-                    tracing::warn!(trace_id = %trace_id, account_id = lease.account_id, error = %redact_log_text(&mark_err.to_string()), "messages account mark error failed");
-                }
-                if let Err(trace_err) =
-                    finish_trace(&state.db, &trace_id, "error", None, Some(&err.to_string())).await
-                {
-                    tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&trace_err.to_string()), "messages trace finish failed");
-                }
-                return upstream_messages_error_response(&err.to_string());
-            }
+            break;
         }
-        let output_tokens = (text.chars().count() as f64 / 4.0).ceil() as u64;
+        if output_tokens == 0 {
+            output_tokens = estimate_local_tokens(&format!("{reasoning}{text}"));
+        }
+        let mut content = Vec::new();
+        if !reasoning.is_empty() {
+            text = format!("{reasoning}{text}");
+        }
+        if !text.is_empty() || tool_calls.is_empty() {
+            content.push(json!({ "type": "text", "text": text }));
+        }
+        for (id, (name, args)) in tool_calls {
+            let input = serde_json::from_str::<Value>(&args)
+                .ok()
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            content.push(json!({
+                "type": "tool_use",
+                "id": id,
+                "name": restore_tool_name(&name, &tool_name_map),
+                "input": input
+            }));
+        }
+        let final_stop_reason = if content
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        {
+            "tool_use"
+        } else {
+            stop_reason.as_str()
+        };
         let response = json!({
             "id": format!("msg_{}", trace_id),
             "type": "message",
             "role": "assistant",
             "model": model,
-            "content": [{ "type": "text", "text": text }],
-            "stop_reason": "end_turn",
+            "content": content,
+            "stop_reason": final_stop_reason,
             "stop_sequence": null,
-            "usage": { "input_tokens": input_tokens, "output_tokens": output_tokens }
+            "usage": {
+                "input_tokens": input_tokens + cached_input_tokens,
+                "output_tokens": output_tokens,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": cached_input_tokens,
+                "service_tier": "standard"
+            }
         });
-        if let Err(err) =
-            add_trace_chunk(&state.db, &trace_id, "downstream_response", &response).await
+        if let Err(err) = add_trace_chunk(
+            &state.db,
+            &state.data_dir,
+            &trace_id,
+            "downstream_response",
+            &response,
+        )
+        .await
         {
             tracing::debug!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages trace chunk write failed");
         }
         if let Err(err) = scheduler.mark_success(&mut lease).await {
             tracing::warn!(trace_id = %trace_id, account_id = lease.account_id, error = %redact_log_text(&err.to_string()), "messages account mark success failed");
         }
-        if let Err(err) = finish_trace(&state.db, &trace_id, "ok", Some("end_turn"), None).await {
+        if let Err(err) =
+            finish_trace(&state.db, &trace_id, "ok", Some(final_stop_reason), None).await
+        {
             tracing::warn!(trace_id = %trace_id, error = %redact_log_text(&err.to_string()), "messages trace finish failed");
         }
         tracing::info!(
@@ -1318,12 +2092,23 @@ async fn accounts_list(
     let sticky_counts = account_sticky_counts(&state.db).await.unwrap_or_default();
     let default_model = get_setting_string(&state.db, "account_probe_model")
         .await
-        .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+        .unwrap_or_else(|| DEFAULT_ADMIN_MODEL.to_string());
+    let default_engine_model = resolve_engine_model(&default_model);
+    let default_upstream_model = default_engine_model
+        .model_uid
+        .as_deref()
+        .unwrap_or(&default_engine_model.id)
+        .to_string();
     let mut accounts = Vec::new();
     for row in rows {
         let scheduler_account = scheduler_account_from_row(&row);
         let availability = scheduler
-            .availability(&scheduler_account, &default_model)
+            .availability(
+                &scheduler_account,
+                &default_model,
+                Some(&default_engine_model.id),
+                Some(&default_upstream_model),
+            )
             .await
             .unwrap_or_else(|_| {
                 AccountAvailability::unavailable(AvailabilityKind::StatusUnavailable, 60)
@@ -1705,7 +2490,7 @@ async fn account_refresh_credits(
     if let Err(resp) = require_admin(&state.db, &headers).await {
         return resp;
     }
-    match refresh_account_status(&state.db, id, false).await {
+    match refresh_account_status(&state.db, &state.data_dir, id, false).await {
         Ok(value) => {
             emit_account_event(&state.events, "status_refreshed", id);
             Json(ApiResponse {
@@ -1737,7 +2522,7 @@ async fn accounts_refresh_credits_all(
     };
     let mut results = Vec::new();
     for id in ids {
-        let result = refresh_account_status(&state.db, id, false).await;
+        let result = refresh_account_status(&state.db, &state.data_dir, id, false).await;
         if result.is_ok() {
             emit_account_event(&state.events, "status_refreshed", id);
         }
@@ -1808,9 +2593,16 @@ async fn account_probe(
         proxy_url: proxy_url_for_account(&state.db, account_id).await,
     };
     let engine_model = resolve_engine_model(&model);
+    log_model_resolution(
+        &format!("probe:{account_id}:{model}"),
+        &model,
+        &engine_model,
+    );
+    let system_prompt_mode = system_prompt_mode_setting(&state.db).await;
     let engine_messages = vec![EngineMessage {
         role: "user".to_string(),
         content: message,
+        ..Default::default()
     }];
     let s = stream! {
         let start = json!({"type": "message_start", "accountId": account_id, "model": model, "email": email});
@@ -1823,6 +2615,11 @@ async fn account_probe(
                 engine_account,
                 engine_model,
                 engine_messages,
+                Vec::new(),
+                EngineToolChoice::Auto,
+                None,
+                system_prompt_mode,
+                None,
             )
             .await
         {
@@ -1881,7 +2678,7 @@ async fn accounts_refresh_status_all(
     };
     let mut results = Vec::new();
     for id in ids {
-        let result = refresh_account_status(&state.db, id, false).await;
+        let result = refresh_account_status(&state.db, &state.data_dir, id, false).await;
         if result.is_ok() {
             emit_account_event(&state.events, "status_refreshed", id);
         }
@@ -2382,10 +3179,15 @@ async fn request_detail(
         .unwrap_or_default()
         .into_iter()
         .map(|row| {
+            let fallback_payload = row.get::<String, _>("payload");
+            let payload = row
+                .get::<Option<String>, _>("payload_path")
+                .and_then(|path| read_trace_payload(&state.data_dir, &path).ok())
+                .unwrap_or(fallback_payload);
             json!({
                 "id": row.get::<i64, _>("id"),
                 "layer": row.get::<String, _>("layer"),
-                "payload": row.get::<String, _>("payload"),
+                "payload": payload,
                 "createdAt": row.get::<String, _>("created_at")
             })
         })
@@ -2395,6 +3197,202 @@ async fn request_detail(
         data: json!({ "request": trace_json(row), "chunks": chunks }),
     })
     .into_response()
+}
+
+async fn admin_stats(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<StatsQuery>,
+) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&state.db, &headers).await {
+        return resp;
+    }
+    let range = stats_range(query.range.as_deref());
+    let since = stats_since_utc(&range).to_rfc3339();
+    let requests = sqlx::query("SELECT * FROM request_traces WHERE started_at >= ? ORDER BY started_at DESC")
+        .bind(&since)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    let accounts = sqlx::query("SELECT * FROM accounts")
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    let jobs = sqlx::query("SELECT * FROM login_jobs WHERE created_at >= ?")
+        .bind(&since)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+    let total_requests = requests.len() as i64;
+    let ok_requests = requests
+        .iter()
+        .filter(|row| row.get::<String, _>("status") == "ok")
+        .count() as i64;
+    let failed_requests = requests
+        .iter()
+        .filter(|row| row.get::<String, _>("status") != "ok")
+        .count() as i64;
+    let running_requests = requests
+        .iter()
+        .filter(|row| row.get::<String, _>("status") == "running")
+        .count() as i64;
+    let avg_latency_ms = average_trace_latency_ms(&requests);
+
+    let mut model_stats: HashMap<String, (i64, i64, i64)> = HashMap::new();
+    let mut account_stats: HashMap<i64, (i64, i64, Option<String>)> = HashMap::new();
+    let mut error_stats: HashMap<String, i64> = HashMap::new();
+    for row in &requests {
+        let status = row.get::<String, _>("status");
+        let ok = status == "ok";
+        let model = row
+            .get::<Option<String>, _>("model")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "未指定".to_string());
+        let entry = model_stats.entry(model).or_insert((0, 0, 0));
+        entry.0 += 1;
+        if ok {
+            entry.1 += 1;
+        } else {
+            entry.2 += 1;
+        }
+        if let Some(account_id) = row.get::<Option<i64>, _>("account_id") {
+            let entry = account_stats.entry(account_id).or_insert((0, 0, None));
+            entry.0 += 1;
+            if !ok {
+                entry.1 += 1;
+                entry.2 = row.get::<Option<String>, _>("error_summary");
+            }
+        }
+        if !ok {
+            let reason = row
+                .get::<Option<String>, _>("error_summary")
+                .or_else(|| row.get::<Option<String>, _>("end_reason"))
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| status.clone());
+            *error_stats.entry(compact_error_reason(&reason)).or_insert(0) += 1;
+        }
+    }
+
+    let account_names = accounts
+        .iter()
+        .map(|row| {
+            let id = row.get::<i64, _>("id");
+            let name = row
+                .get::<Option<String>, _>("label")
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| row.get::<String, _>("email"));
+            (id, name)
+        })
+        .collect::<HashMap<_, _>>();
+    let account_rows = accounts
+        .iter()
+        .map(|row| {
+            let status = row.get::<String, _>("status");
+            let rate_limited = row.get::<Option<String>, _>("rate_limited_until").is_some_and(|value| {
+                chrono::DateTime::parse_from_rfc3339(&value)
+                    .map(|time| time.with_timezone(&Utc) > Utc::now())
+                    .unwrap_or(false)
+            });
+            json!({
+                "id": row.get::<i64, _>("id"),
+                "name": account_names.get(&row.get::<i64, _>("id")).cloned().unwrap_or_else(|| row.get::<String, _>("email")),
+                "status": status,
+                "rateLimited": rate_limited,
+                "errorCount": row.get::<i64, _>("error_count"),
+                "lastError": row.get::<Option<String>, _>("last_error")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Json(ApiResponse {
+        success: true,
+        data: json!({
+            "range": { "key": range.key, "label": range.label, "since": since },
+            "overview": {
+                "requests": total_requests,
+                "succeeded": ok_requests,
+                "failed": failed_requests,
+                "running": running_requests,
+                "successRate": percent(ok_requests, total_requests),
+                "avgLatencyMs": avg_latency_ms,
+                "accounts": accounts.len(),
+                "availableAccounts": accounts.iter().filter(|row| ["ready", "active", "ok"].contains(&row.get::<String, _>("status").as_str())).count(),
+                "issueAccounts": accounts.iter().filter(|row| account_has_issue(row)).count()
+            },
+            "models": sorted_stat_rows(model_stats, |model, (total, ok, failed)| json!({
+                "model": model,
+                "requests": total,
+                "succeeded": ok,
+                "failed": failed,
+                "successRate": percent(ok, total)
+            })),
+            "accounts": sorted_stat_rows(account_stats, |id, (total, failed, last_error)| json!({
+                "accountId": id,
+                "name": account_names.get(&id).cloned().unwrap_or_else(|| format!("#{id}")),
+                "requests": total,
+                "failed": failed,
+                "successRate": percent(total - failed, total),
+                "lastError": last_error
+            })),
+            "errors": sorted_stat_rows(error_stats, |message, count| json!({ "message": message, "count": count })),
+            "accountStates": account_rows,
+            "loginJobs": {
+                "total": jobs.len(),
+                "running": jobs.iter().filter(|row| row.get::<String, _>("status") == "running").count(),
+                "succeeded": jobs.iter().map(|row| row.get::<i64, _>("success_count")).sum::<i64>(),
+                "failed": jobs.iter().map(|row| row.get::<i64, _>("failed_count")).sum::<i64>()
+            },
+            "timeline": stats_timeline(&requests, &range)
+        }),
+    })
+    .into_response()
+}
+
+async fn admin_models_config_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&state.db, &headers).await {
+        return resp;
+    }
+    models_config_response(&state.db).await
+}
+
+async fn admin_models_config_put(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<SaveModelControlRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&state.db, &headers).await {
+        return resp;
+    }
+    let all_models = model_catalog(&state.db).await;
+    let known = all_models
+        .iter()
+        .filter_map(|model| model.get("id").and_then(Value::as_str).map(model_alias))
+        .collect::<HashSet<_>>();
+    let default_model = model_alias(&payload.default_model);
+    if !known.contains(&default_model) {
+        return error(StatusCode::BAD_REQUEST, "invalid_default_model", "请选择可用的默认模型");
+    }
+    let disabled_models = payload
+        .disabled_models
+        .into_iter()
+        .map(|model| model_alias(&model))
+        .filter(|model| known.contains(model))
+        .collect::<HashSet<_>>();
+    if disabled_models.contains(&default_model) {
+        return error(StatusCode::BAD_REQUEST, "default_model_disabled", "默认模型需要保持可用");
+    }
+    let settings = ModelControlSettings {
+        default_model: Some(default_model),
+        disabled_models: disabled_models.into_iter().collect(),
+    };
+    match save_json_setting(&state.db, "modelControl", &json!(settings)).await {
+        Ok(_) => models_config_response(&state.db).await,
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, "model_config_save_failed", &err.to_string()),
+    }
 }
 
 async fn capacity_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
@@ -2455,11 +3453,12 @@ async fn settings_get(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
         .unwrap_or_default();
     let mut map = serde_json::Map::new();
     for row in rows {
-        map.insert(
-            row.get::<String, _>("key"),
-            json!(row.get::<String, _>("value")),
-        );
+        let raw = row.get::<String, _>("value");
+        let value = serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!(raw));
+        map.insert(row.get::<String, _>("key"), value);
     }
+    map.entry("systemPromptMode".to_string())
+        .or_insert_with(|| json!(DEFAULT_SYSTEM_PROMPT_MODE_SETTING));
     Json(ApiResponse {
         success: true,
         data: Value::Object(map),
@@ -2486,6 +3485,17 @@ async fn settings_put(
                     StatusCode::BAD_REQUEST,
                     "use_client_api_key_page",
                     "请在调用密钥页面管理",
+                );
+            }
+            if key == "systemPromptMode"
+                && !value
+                    .as_str()
+                    .is_some_and(|mode| parse_system_prompt_mode(mode).is_some())
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_system_prompt_mode",
+                    "请选择可用的提示词处理方式",
                 );
             }
             let stored_value = value.to_string();
@@ -2524,6 +3534,23 @@ async fn get_setting_string(db: &SqlitePool, key: &str) -> Option<String> {
     serde_json::from_str::<String>(&raw).ok().or(Some(raw))
 }
 
+fn parse_system_prompt_mode(value: &str) -> Option<SystemPromptMode> {
+    match value {
+        "passthrough" => Some(SystemPromptMode::Passthrough),
+        "strip-identity" => Some(SystemPromptMode::StripIdentity),
+        "windsurf-wrap" => Some(SystemPromptMode::WindsurfWrap),
+        _ => None,
+    }
+}
+
+async fn system_prompt_mode_setting(db: &SqlitePool) -> SystemPromptMode {
+    get_setting_string(db, "systemPromptMode")
+        .await
+        .as_deref()
+        .and_then(parse_system_prompt_mode)
+        .unwrap_or(SystemPromptMode::StripIdentity)
+}
+
 async fn save_json_setting(db: &SqlitePool, key: &str, value: &Value) -> anyhow::Result<()> {
     sqlx::query("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)")
         .bind(key)
@@ -2540,6 +3567,322 @@ async fn capacity_settings(db: &SqlitePool) -> anyhow::Result<CapacitySettings> 
     };
     let parsed = serde_json::from_str::<CapacitySettings>(&raw).unwrap_or_default();
     Ok(normalize_capacity(parsed))
+}
+
+async fn model_control_settings(db: &SqlitePool) -> anyhow::Result<ModelControlSettings> {
+    let Some(raw) = get_setting_string(db, "modelControl").await else {
+        return Ok(ModelControlSettings::default());
+    };
+    let mut parsed = serde_json::from_str::<ModelControlSettings>(&raw).unwrap_or_default();
+    parsed.default_model = parsed
+        .default_model
+        .map(|model| model_alias(&model))
+        .filter(|model| !model.trim().is_empty());
+    parsed.disabled_models = parsed
+        .disabled_models
+        .into_iter()
+        .map(|model| model_alias(&model))
+        .filter(|model| !model.trim().is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(parsed)
+}
+
+fn disabled_model_set(settings: &ModelControlSettings) -> HashSet<String> {
+    settings
+        .disabled_models
+        .iter()
+        .map(|model| model_alias(model))
+        .collect()
+}
+
+struct StatsRange {
+    key: &'static str,
+    label: &'static str,
+    hours: i64,
+    bucket_hours: i64,
+}
+
+fn stats_range(value: Option<&str>) -> StatsRange {
+    match value.unwrap_or("24h") {
+        "7d" => StatsRange {
+            key: "7d",
+            label: "近 7 天",
+            hours: 24 * 7,
+            bucket_hours: 24,
+        },
+        "30d" => StatsRange {
+            key: "30d",
+            label: "近 30 天",
+            hours: 24 * 30,
+            bucket_hours: 24,
+        },
+        _ => StatsRange {
+            key: "24h",
+            label: "近 24 小时",
+            hours: 24,
+            bucket_hours: 1,
+        },
+    }
+}
+
+fn percent(part: i64, total: i64) -> i64 {
+    if total <= 0 {
+        0
+    } else {
+        ((part.max(0) as f64 / total as f64) * 100.0).round() as i64
+    }
+}
+
+fn average_trace_latency_ms(rows: &[sqlx::sqlite::SqliteRow]) -> i64 {
+    let mut total = 0_i64;
+    let mut count = 0_i64;
+    for row in rows {
+        let started = row.get::<String, _>("started_at");
+        let Some(ended) = row.get::<Option<String>, _>("ended_at") else {
+            continue;
+        };
+        let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(&started) else {
+            continue;
+        };
+        let Ok(ended_at) = chrono::DateTime::parse_from_rfc3339(&ended) else {
+            continue;
+        };
+        total += ended_at
+            .signed_duration_since(started_at)
+            .num_milliseconds()
+            .max(0);
+        count += 1;
+    }
+    if count == 0 { 0 } else { total / count }
+}
+
+fn compact_error_reason(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= 120 {
+        return trimmed.to_string();
+    }
+    let mut out = trimmed.chars().take(120).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn sorted_stat_rows<K, V, F>(items: HashMap<K, V>, map: F) -> Vec<Value>
+where
+    K: Eq + std::hash::Hash,
+    F: Fn(K, V) -> Value,
+{
+    let mut rows = items
+        .into_iter()
+        .map(|(key, value)| map(key, value))
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        let left = a
+            .get("requests")
+            .or_else(|| a.get("count"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let right = b
+            .get("requests")
+            .or_else(|| b.get("count"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        right.cmp(&left)
+    });
+    rows
+}
+
+fn account_has_issue(row: &sqlx::sqlite::SqliteRow) -> bool {
+    let status = row.get::<String, _>("status");
+    let rate_limited = row.get::<Option<String>, _>("rate_limited_until").is_some_and(|value| {
+        chrono::DateTime::parse_from_rfc3339(&value)
+            .map(|time| time.with_timezone(&Utc) > Utc::now())
+            .unwrap_or(false)
+    });
+    !["ready", "active", "ok"].contains(&status.as_str())
+        || row.get::<i64, _>("error_count") > 0
+        || row.get::<Option<String>, _>("last_error").is_some()
+        || row.get::<Option<String>, _>("credentials_json").is_none()
+        || rate_limited
+}
+
+fn stats_timeline(rows: &[sqlx::sqlite::SqliteRow], range: &StatsRange) -> Vec<Value> {
+    let start = shanghai_bucket_start(stats_since_utc(range), range.bucket_hours);
+    let end = shanghai_bucket_start(Utc::now(), range.bucket_hours);
+    let bucket_count = (end
+        .signed_duration_since(start)
+        .num_hours()
+        .div_euclid(range.bucket_hours)
+        + 1)
+        .max(1);
+    let mut buckets = (0..bucket_count)
+        .map(|index| {
+            let time = start + Duration::hours(index * range.bucket_hours);
+            let label = if range.bucket_hours == 1 {
+                time.format("%H:00").to_string()
+            } else {
+                time.format("%m-%d").to_string()
+            };
+            (label, 0_i64, 0_i64, 0_i64)
+        })
+        .collect::<Vec<_>>();
+    for row in rows {
+        let started = row.get::<String, _>("started_at");
+        let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(&started) else {
+            continue;
+        };
+        let elapsed_hours = started_at
+            .with_timezone(&shanghai_offset())
+            .signed_duration_since(start)
+            .num_hours();
+        if elapsed_hours < 0 {
+            continue;
+        }
+        let index = (elapsed_hours / range.bucket_hours) as usize;
+        let Some(bucket) = buckets.get_mut(index) else {
+            continue;
+        };
+        bucket.1 += 1;
+        if row.get::<String, _>("status") == "ok" {
+            bucket.2 += 1;
+        } else {
+            bucket.3 += 1;
+        }
+    }
+    buckets
+        .into_iter()
+        .map(|(label, requests, succeeded, failed)| {
+            json!({ "label": label, "requests": requests, "succeeded": succeeded, "failed": failed })
+        })
+        .collect()
+}
+
+fn shanghai_offset() -> FixedOffset {
+    FixedOffset::east_opt(8 * 60 * 60).expect("valid Asia/Shanghai offset")
+}
+
+fn stats_since_utc(range: &StatsRange) -> DateTime<Utc> {
+    if range.bucket_hours == 1 {
+        return Utc::now() - Duration::hours(range.hours);
+    }
+    shanghai_bucket_start(
+        Utc::now() - Duration::hours(range.hours - range.bucket_hours),
+        range.bucket_hours,
+    )
+    .with_timezone(&Utc)
+}
+
+fn shanghai_bucket_start(time: DateTime<Utc>, bucket_hours: i64) -> DateTime<FixedOffset> {
+    let bucket_secs = (bucket_hours.max(1) * 60 * 60).max(1);
+    let offset_secs = i64::from(shanghai_offset().local_minus_utc());
+    let local_ts = time.timestamp() + offset_secs;
+    let bucket_local_ts = local_ts.div_euclid(bucket_secs) * bucket_secs;
+    let bucket_utc_ts = bucket_local_ts - offset_secs;
+    DateTime::<Utc>::from_timestamp(bucket_utc_ts, 0)
+        .unwrap_or(time)
+        .with_timezone(&shanghai_offset())
+}
+
+async fn models_config_response(db: &SqlitePool) -> Response {
+    let settings = model_control_settings(db).await.unwrap_or_default();
+    let disabled = disabled_model_set(&settings);
+    let catalog = model_catalog(db).await;
+    let rows = sqlx::query("SELECT id, available_models_json FROM accounts")
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+    let model_limits = account_model_rate_limits(db).await.unwrap_or_default();
+    let recent_since = (Utc::now() - Duration::hours(24)).to_rfc3339();
+    let recent_failures = sqlx::query("SELECT model, COUNT(*) AS count FROM request_traces WHERE started_at >= ? AND status != 'ok' GROUP BY model")
+        .bind(recent_since)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            let model = row.get::<Option<String>, _>("model")?;
+            Some((model_alias(&model), row.get::<i64, _>("count")))
+        })
+        .collect::<HashMap<_, _>>();
+    let coverage = model_account_coverage(&rows);
+    let limited = model_limited_account_counts(&model_limits);
+    let default_model = settings
+        .default_model
+        .clone()
+        .filter(|model| catalog.iter().any(|item| item.get("id").and_then(Value::as_str).is_some_and(|id| model_alias(id) == *model)))
+        .unwrap_or_else(|| {
+            catalog
+                .first()
+                .and_then(|model| model.get("id").and_then(Value::as_str))
+                .map(model_alias)
+                .unwrap_or_else(|| DEFAULT_CHAT_MODEL.to_string())
+        });
+    let models = catalog
+        .into_iter()
+        .filter_map(|model| {
+            let id = model.get("id").and_then(Value::as_str)?;
+            let key = model_alias(id);
+            Some(json!({
+                "id": id,
+                "label": model.get("label").and_then(Value::as_str).unwrap_or(id),
+                "provider": model.get("provider").and_then(Value::as_str).unwrap_or("windsurf"),
+                "creditMultiplier": model.get("creditMultiplier").cloned().unwrap_or(Value::Null),
+                "supportsImages": model.get("supportsImages").and_then(Value::as_bool).unwrap_or(false),
+                "enabled": !disabled.contains(&key),
+                "accountCount": coverage.get(&key).copied().unwrap_or(0),
+                "limitedAccountCount": limited.get(&key).copied().unwrap_or(0),
+                "recentFailures": recent_failures.get(&key).copied().unwrap_or(0)
+            }))
+        })
+        .collect::<Vec<_>>();
+    Json(ApiResponse {
+        success: true,
+        data: json!({
+            "defaultModel": default_model,
+            "disabledModels": disabled.into_iter().collect::<Vec<_>>(),
+            "models": models
+        }),
+    })
+    .into_response()
+}
+
+fn model_account_coverage(rows: &[sqlx::sqlite::SqliteRow]) -> HashMap<String, i64> {
+    let mut coverage: HashMap<String, HashSet<i64>> = HashMap::new();
+    for row in rows {
+        let account_id = row.get::<i64, _>("id");
+        let Some(raw) = row.get::<Option<String>, _>("available_models_json") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(items) = value.as_array() else {
+            continue;
+        };
+        for item in items {
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                coverage.entry(model_alias(id)).or_default().insert(account_id);
+            }
+        }
+    }
+    coverage
+        .into_iter()
+        .map(|(model, accounts)| (model, accounts.len() as i64))
+        .collect()
+}
+
+fn model_limited_account_counts(model_limits: &HashMap<i64, Value>) -> HashMap<String, i64> {
+    let mut counts = HashMap::new();
+    for limits in model_limits.values() {
+        let Some(items) = limits.as_object() else {
+            continue;
+        };
+        for model in items.keys() {
+            *counts.entry(model_alias(model)).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 fn normalize_capacity(mut settings: CapacitySettings) -> CapacitySettings {
@@ -2602,15 +3945,46 @@ fn default_model_catalog() -> Vec<Value> {
     [
         ("claude-opus-4.7", "Claude Opus 4.7", "anthropic", 8.0),
         (
+            "claude-opus-4.7-medium",
+            "Claude Opus 4.7 Medium",
+            "anthropic",
+            8.0,
+        ),
+        (
             "claude-opus-4.7-high",
             "Claude Opus 4.7 High",
             "anthropic",
             10.0,
         ),
+        (
+            "claude-opus-4.7-max",
+            "Claude Opus 4.7 Max",
+            "anthropic",
+            12.0,
+        ),
         ("claude-opus-4.6", "Claude Opus 4.6", "anthropic", 6.0),
+        (
+            "claude-opus-4.6-thinking",
+            "Claude Opus 4.6 Thinking",
+            "anthropic",
+            6.0,
+        ),
         ("claude-sonnet-4.6", "Claude Sonnet 4.6", "anthropic", 4.0),
+        (
+            "claude-sonnet-4.6-thinking",
+            "Claude Sonnet 4.6 Thinking",
+            "anthropic",
+            4.0,
+        ),
         ("claude-4.5-sonnet", "Claude Sonnet 4.5", "anthropic", 2.0),
         ("gemini-2.5-flash", "Gemini 2.5 Flash", "google", 0.5),
+        (
+            "chat-gpt-4.1-mini-2025.04.14",
+            "GPT-4.1 mini",
+            "openai",
+            0.5,
+        ),
+        ("gpt-5-nano", "GPT-5 nano", "openai", 0.5),
     ]
     .into_iter()
     .map(|(id, label, provider, credit)| {
@@ -2647,23 +4021,145 @@ async fn proxy_url_for_account(db: &SqlitePool, account_id: i64) -> Option<Strin
     row.get::<Option<String>, _>("url")
 }
 
+const MAX_TOOL_DESCRIPTION_LEN: usize = 4096;
+const TOOL_DESC_TRUNCATE_SUFFIX: &str =
+    " [...truncated; full reference in <tool_documentation> section of system prompt]";
+const TOOL_DESCRIPTION_RISK_REPLACEMENT_SYSTEM: &str = "You are a helpful coding assistant. Help users with software engineering tasks. Use the provided tools when needed. Be concise and accurate.";
+const DEFAULT_ANONYMOUS_TOOL_NAME_PREFIX: &str = "client_tool";
+
+#[derive(Debug, Clone)]
+struct ToolDoc {
+    name: String,
+    full_description: String,
+}
+
+#[derive(Debug, Clone)]
+struct ToolRisk {
+    risky: bool,
+    reason: String,
+}
+
 fn messages_from_anthropic(value: &Value) -> Vec<EngineMessage> {
-    value
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| EngineMessage {
-                    role: item
-                        .get("role")
-                        .and_then(Value::as_str)
-                        .unwrap_or("user")
-                        .to_string(),
-                    content: anthropic_content_to_text(item.get("content").unwrap_or(&Value::Null)),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let Some(item) = item.as_object() else {
+            continue;
+        };
+        let role = item
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+            .to_string();
+        let content = item.get("content").unwrap_or(&Value::Null);
+        if role == "tool" {
+            let tool_call_id = item
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if tool_call_id.is_empty() {
+                continue;
+            }
+            out.push(EngineMessage {
+                role,
+                content: flatten_tool_result_content(content),
+                tool_call_id: Some(tool_call_id.to_string()),
+                ..Default::default()
+            });
+            continue;
+        }
+
+        if let Some(text) = content.as_str() {
+            out.push(EngineMessage {
+                role,
+                content: text.to_string(),
+                ..Default::default()
+            });
+            continue;
+        }
+
+        if !content.is_array() {
+            let text = anthropic_content_to_text(content);
+            if !text.trim().is_empty() {
+                out.push(EngineMessage {
+                    role,
+                    content: text,
+                    ..Default::default()
+                });
+            }
+            continue;
+        }
+
+        let mut text_parts = Vec::new();
+        let mut thinking_parts = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut tool_results = Vec::new();
+        for block in content.as_array().unwrap_or(&Vec::new()) {
+            let Some(block) = block.as_object() else {
+                continue;
+            };
+            match block.get("type").and_then(Value::as_str).unwrap_or("") {
+                "text" => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        text_parts.push(text.to_string());
+                    }
+                }
+                "thinking" => {
+                    if let Some(thinking) = block.get("thinking").and_then(Value::as_str) {
+                        thinking_parts.push(thinking.to_string());
+                    }
+                }
+                "tool_use" => {
+                    let Some(id) = block.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(name) = block.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                    let arguments =
+                        serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                    tool_calls.push(engine::EngineToolCall {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        arguments,
+                    });
+                }
+                "tool_result" => {
+                    if let Some(tool_call_id) = block.get("tool_use_id").and_then(Value::as_str) {
+                        tool_results.push(EngineMessage {
+                            role: "tool".to_string(),
+                            content: flatten_tool_result_content(
+                                block.get("content").unwrap_or(&Value::Null),
+                            ),
+                            tool_call_id: Some(tool_call_id.to_string()),
+                            ..Default::default()
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for tool_result in tool_results {
+            out.push(tool_result);
+        }
+
+        let content_text = text_parts.join("\n").trim().to_string();
+        let reasoning_content = thinking_parts.join("\n").trim().to_string();
+        if !content_text.is_empty() || !reasoning_content.is_empty() || !tool_calls.is_empty() {
+            out.push(EngineMessage {
+                role,
+                content: content_text,
+                tool_calls,
+                reasoning_content: (!reasoning_content.is_empty()).then_some(reasoning_content),
+                ..Default::default()
+            });
+        }
+    }
+    out
 }
 
 fn messages_from_request(payload: &MessagesRequest) -> Vec<EngineMessage> {
@@ -2671,29 +4167,124 @@ fn messages_from_request(payload: &MessagesRequest) -> Vec<EngineMessage> {
     if let Some(system) = payload.system.as_ref() {
         let content = anthropic_content_to_text(system);
         if !content.trim().is_empty() {
-            merge_system_into_user_context(&mut messages, &content);
+            messages.insert(
+                0,
+                EngineMessage {
+                    role: "system".to_string(),
+                    content,
+                    ..Default::default()
+                },
+            );
         }
     }
     messages
 }
 
-fn merge_system_into_user_context(messages: &mut Vec<EngineMessage>, system: &str) {
-    let system = system.trim();
-    if system.is_empty() {
-        return;
+fn extract_caller_environment(messages: &[EngineMessage]) -> Option<String> {
+    let cwd = extract_cwd_from_messages(messages)?;
+    let mut lines = vec![format!("- Working directory: {cwd}")];
+    if let Some(value) = extract_env_line(
+        messages,
+        r"(?im)(?:^|\n)\s*(?:[-*]\s*)?Is(?:\s+(?:directory\s+)?(?:a\s+)?)git\s+repo(?:sitory)?\s*[:=]\s*([^\n<]+)",
+    ) {
+        lines.push(format!("- Is the directory a git repo: {value}"));
     }
-    let prefix = format!("System context:\n{system}\n\nUser request:\n");
-    if let Some(first_user) = messages.iter_mut().find(|message| message.role == "user") {
-        first_user.content = format!("{prefix}{}", first_user.content);
-    } else {
-        messages.insert(
-            0,
-            EngineMessage {
-                role: "user".to_string(),
-                content: prefix.trim_end().to_string(),
-            },
-        );
+    if let Some(value) = extract_env_line(
+        messages,
+        r"(?im)(?:^|\n)\s*(?:[-*]\s*)?Platform\s*[:=]\s*([^\n<]+)",
+    ) {
+        lines.push(format!("- Platform: {value}"));
     }
+    if let Some(value) = extract_env_line(
+        messages,
+        r"(?im)(?:^|\n)\s*(?:[-*]\s*)?OS\s+[Vv]ersion\s*[:=]\s*([^\n<]+)",
+    ) {
+        lines.push(format!("- OS version: {value}"));
+    }
+    Some(lines.join("\n"))
+}
+
+fn extract_cwd_from_messages(messages: &[EngineMessage]) -> Option<String> {
+    let path_tail = r#"((?:[\/~]|[A-Za-z]:\\)[^\s`'"<>\n.,;)]+)"#;
+    let cwd_patterns = [
+        format!(
+            r#"(?im)(?:^|\n)\s*(?:[-*]\s*)?(?:(?:Primary|Current|Initial|Default|Active|Project|My)\s+)?(?:Working\s+directory|cwd)\s*[:=]\s*`?{path_tail}`?"#
+        ),
+        format!(r#"(?im)(?:current\s+working\s+directory(?:\s+is)?)\s*[:=]?\s*`?{path_tail}`?"#),
+        format!(r#"(?im)<cwd>\s*{path_tail}\s*</cwd>"#),
+    ];
+    for pattern in cwd_patterns {
+        if let Some(value) = extract_env_line(messages, &pattern) {
+            return Some(value);
+        }
+    }
+    scan_user_message_for_bare_cwd(messages).or_else(|| scan_system_for_bullet_cwd(messages))
+}
+
+fn extract_env_line(messages: &[EngineMessage], pattern: &str) -> Option<String> {
+    let re = Regex::new(pattern).ok()?;
+    for message in messages {
+        for captures in re.captures_iter(&message.content) {
+            for index in 1..captures.len() {
+                let Some(value) = captures.get(index).map(|m| m.as_str().trim()) else {
+                    continue;
+                };
+                if valid_environment_value(value) {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn scan_user_message_for_bare_cwd(messages: &[EngineMessage]) -> Option<String> {
+    let re = Regex::new(r#"(?m)^[\s,;:.，。、；：　"'`(\[]*((?:[A-Za-z]:[\\/]|/[A-Za-z]|~[\\/])[A-Za-z0-9._\\/-]+)"#).ok()?;
+    for message in messages {
+        if message.role != "user" {
+            continue;
+        }
+        let head = message.content.chars().take(300).collect::<String>();
+        let Some(captures) = re.captures(&head) else {
+            continue;
+        };
+        let value = captures.get(1).map(|m| m.as_str().trim())?;
+        if valid_cwd_candidate(value) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn scan_system_for_bullet_cwd(messages: &[EngineMessage]) -> Option<String> {
+    let re = Regex::new(
+        r#"(?m)^[\s]*[-*•]\s+`?((?:[A-Za-z]:[\\/]|/[A-Za-z]|~[\\/])[^\s`'"<>\n]+)`?\s*$"#,
+    )
+    .ok()?;
+    for message in messages {
+        if message.role != "system" {
+            continue;
+        }
+        for captures in re.captures_iter(&message.content) {
+            let value = captures.get(1).map(|m| m.as_str().trim())?;
+            if valid_cwd_candidate(value) {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn valid_environment_value(value: &str) -> bool {
+    !value.is_empty() && value != "<workspace>" && !value.chars().any(|ch| ch.is_control())
+}
+
+fn valid_cwd_candidate(value: &str) -> bool {
+    valid_environment_value(value)
+        && value.len() >= 5
+        && Regex::new(r"(?i)\.(?:js|mjs|cjs|ts|tsx|jsx|json|jsonc|md|mdx|py|pyc|go|rs|java|kt|swift|cpp|cc|cxx|c|h|hpp|html?|css|scss|sass|less|yaml|yml|toml|ini|cfg|conf|sh|bash|zsh|fish|ps1|bat|cmd|exe|dll|so|dylib|zip|tar|gz|bz2|xz|7z|rar|png|jpe?g|gif|webp|svg|ico|mp[34]|wav|flac|ogg|webm|mov|avi|mkv|pdf|docx?|xlsx?|pptx?|csv|tsv|sql|db|sqlite|log|lock|map|min\.js|min\.css)$")
+            .map(|re| !re.is_match(value))
+            .unwrap_or(true)
 }
 
 fn anthropic_content_to_text(value: &Value) -> String {
@@ -2707,6 +4298,11 @@ fn anthropic_content_to_text(value: &Value) -> String {
                 item.get("text")
                     .and_then(Value::as_str)
                     .map(str::to_string)
+                    .or_else(|| {
+                        item.get("thinking")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
                     .or_else(|| item.as_str().map(str::to_string))
             })
             .collect::<Vec<_>>()
@@ -2719,12 +4315,56 @@ fn anthropic_content_to_text(value: &Value) -> String {
     }
 }
 
+fn flatten_tool_result_content(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_string();
+    }
+    if let Some(items) = value.as_array() {
+        let text = items
+            .iter()
+            .filter_map(|item| {
+                item.get("type")
+                    .and_then(Value::as_str)
+                    .filter(|kind| *kind == "text")
+                    .and_then(|_| item.get("text").and_then(Value::as_str))
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if items.iter().any(|item| {
+            item.get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        }) {
+            return format!("Error: {}", text);
+        }
+        return text;
+    }
+    value.to_string()
+}
+
 fn estimate_input_tokens_from_messages(messages: &[EngineMessage]) -> u64 {
-    let text_len: usize = messages
-        .iter()
-        .map(|message| message.content.chars().count() + message.role.chars().count())
-        .sum();
-    ((text_len as f64 / 4.0).ceil() as u64).max(1)
+    let mut total = 0_u64;
+    for message in messages {
+        total += estimate_local_tokens(&message.role);
+        total += estimate_local_tokens(&message.content);
+        if let Some(reasoning) = message.reasoning_content.as_deref() {
+            total += estimate_local_tokens(reasoning);
+        }
+        if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+            total += estimate_local_tokens(tool_call_id);
+        }
+        for tool_call in &message.tool_calls {
+            total += estimate_local_tokens(&tool_call.id);
+            total += estimate_local_tokens(&tool_call.name);
+            total += estimate_local_tokens(&tool_call.arguments);
+        }
+    }
+    total.max(1)
+}
+
+fn estimate_local_tokens(text: &str) -> u64 {
+    ((text.chars().count() as f64 / 3.5).ceil() as u64).max(1)
 }
 
 fn message_debug_summary(payload: &MessagesRequest) -> MessageDebugSummary {
@@ -2777,6 +4417,694 @@ fn sanitized_message_request(payload: &MessagesRequest, summary: &MessageDebugSu
     })
 }
 
+const TOOL_DESCRIPTION_RISK_SIGNATURES: &[(&str, &str)] = &[
+    (
+        "Claude Code 67 工具",
+        "Agent,AskUserQuestion,Bash,CronCreate,CronDelete,CronList,Edit,EnterPlanMode,EnterWorktree,ExitPlanMode,ExitWorktree,Glob",
+    ),
+    (
+        "Shell/Edit 工具客户端",
+        "Shell,Glob,Grep,AwaitShell,Read,Delete,Edit,Write",
+    ),
+    (
+        "Process/Browser 工具客户端",
+        "str-replace-editor,open-browser,diagnostics,read-terminal,git-commit-retrieval,launch-process,kill-process,read-process",
+    ),
+    (
+        "OpenClaw 默认工具",
+        "agents_list,browser,canvas,edit,exec,image,js-reverse__break_on_xhr,js-reverse__evaluate_script,js-reverse__get_paused_info,js-reverse__get_request_initiator,js-reverse__get_script_source,js-reverse__get_websocket_messages",
+    ),
+    (
+        "OpenClaw 快照工具",
+        "canvas,nodes,cron,message,tts,gateway,agents_list,sessions_list,sessions_history,sessions_send,sessions_spawn,sessions_yield,subagents,session_status,web_search,web_fetch",
+    ),
+];
+
+#[derive(Debug, Clone)]
+struct ToolIsolation {
+    tools: Vec<EngineTool>,
+    messages: Vec<EngineMessage>,
+    tool_choice: EngineToolChoice,
+    truncated_docs: Vec<ToolDoc>,
+    to_client_name: HashMap<String, String>,
+}
+
+fn is_probe_request(payload: &MessagesRequest) -> bool {
+    payload.max_tokens == Some(1) && payload.stream == Some(false)
+}
+
+fn send_probe_response(model: &str) -> Response {
+    Json(json!({
+        "id": format!("msg_probe_{}", Uuid::new_v4().simple()),
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "" }],
+        "model": if model.trim().is_empty() { "claude-haiku-4-5-20251001" } else { model },
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 1,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        }
+    }))
+    .into_response()
+}
+
+fn empty_anthropic_message_response(trace_id: String, model: String) -> Response {
+    Json(json!({
+        "id": format!("msg_{}", trace_id),
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "" }],
+        "model": model,
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": 1,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "service_tier": "standard"
+        }
+    }))
+    .into_response()
+}
+
+fn empty_anthropic_stream_response(trace_id: String, model: String) -> Response {
+    let s = stream! {
+        yield Ok::<Event, std::convert::Infallible>(anthropic_sse_event("message_start", json!({
+            "type": "message_start",
+            "message": {
+                "id": format!("msg_{}", trace_id),
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": { "input_tokens": 1, "output_tokens": 0 }
+            }
+        })));
+        yield Ok(anthropic_sse_event("content_block_start", json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "text", "text": "" }
+        })));
+        yield Ok(anthropic_sse_event("content_block_stop", json!({
+            "type": "content_block_stop",
+            "index": 0
+        })));
+        yield Ok(anthropic_sse_event("message_delta", json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "service_tier": "standard"
+            }
+        })));
+        yield Ok(anthropic_sse_event("message_stop", json!({"type": "message_stop"})));
+    };
+    Sse::new(s).keep_alive(KeepAlive::default()).into_response()
+}
+
+fn is_claude_code_client(headers: &HeaderMap) -> bool {
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if user_agent
+        .split_whitespace()
+        .any(|value| value.contains("claude-cli") || value.contains("claude-code"))
+    {
+        return true;
+    }
+    headers
+        .get("x-claude-code-session-id")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn detect_tool_description_risk_client(headers: &HeaderMap, tools: &[EngineTool]) -> ToolRisk {
+    let header_hit = headers.iter().find_map(|(name, value)| {
+        let name_hit = name.as_str().contains("claude-cli")
+            || name.as_str().contains("claude-code")
+            || name.as_str().contains("augment")
+            || name.as_str().contains("cursor");
+        let value_hit = value
+            .to_str()
+            .ok()
+            .map(|value| value.to_ascii_lowercase())
+            .is_some_and(|v| {
+                v.contains("claude-cli")
+                    || v.contains("claude-code")
+                    || v.contains("augment")
+                    || v.contains("cursor")
+            });
+        if name_hit || value_hit {
+            Some(format!("header:{}", name.as_str().to_lowercase()))
+        } else {
+            None
+        }
+    });
+    if let Some(reason) = header_hit {
+        return ToolRisk {
+            risky: true,
+            reason,
+        };
+    }
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    for (idx, (_, sequence)) in TOOL_DESCRIPTION_RISK_SIGNATURES.iter().enumerate() {
+        let signature = sequence
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>();
+        if has_ordered_tool_prefix(&tool_names, &signature) {
+            return ToolRisk {
+                risky: true,
+                reason: format!(
+                    "tools:configured-sequence:{}:{}",
+                    idx + 1,
+                    TOOL_DESCRIPTION_RISK_SIGNATURES[idx].0
+                ),
+            };
+        }
+    }
+    let known = [
+        "Agent",
+        "AskUserQuestion",
+        "Bash",
+        "Edit",
+        "Glob",
+        "Grep",
+        "Read",
+    ];
+    let hits = known
+        .iter()
+        .filter(|name| tools.iter().any(|tool| tool.name == **name))
+        .count();
+    if tools.len() >= 20 && hits >= 5 {
+        return ToolRisk {
+            risky: true,
+            reason: format!("tools:claude-code-signature:{}", known[..hits].join(",")),
+        };
+    }
+    ToolRisk {
+        risky: false,
+        reason: "none".to_string(),
+    }
+}
+
+fn has_ordered_tool_prefix(tool_names: &[&str], signature: &[&str]) -> bool {
+    signature
+        .iter()
+        .enumerate()
+        .all(|(idx, name)| tool_names.get(idx).is_some_and(|value| value == name))
+}
+
+fn sanitize_tools(raw: Option<&Value>) -> (Vec<EngineTool>, Vec<ToolDoc>) {
+    let Some(items) = raw.and_then(Value::as_array) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut tools = Vec::new();
+    let mut truncated_docs = Vec::new();
+    for item in items {
+        let Some(tool_obj) = item.as_object() else {
+            continue;
+        };
+        let (name, description_raw, parameters_raw) =
+            if tool_obj.get("type").and_then(Value::as_str) == Some("function") {
+                let Some(func) = tool_obj.get("function").and_then(Value::as_object) else {
+                    continue;
+                };
+                (
+                    func.get("name").and_then(Value::as_str),
+                    func.get("description").and_then(Value::as_str),
+                    func.get("parameters"),
+                )
+            } else {
+                (
+                    tool_obj.get("name").and_then(Value::as_str),
+                    tool_obj.get("description").and_then(Value::as_str),
+                    tool_obj.get("input_schema"),
+                )
+            };
+        let Some(name) = name else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let mut description = description_raw.map(str::to_string);
+        if let Some(desc) = description.as_ref() {
+            let bytes = desc.as_bytes();
+            if bytes.len() > MAX_TOOL_DESCRIPTION_LEN {
+                let keep = MAX_TOOL_DESCRIPTION_LEN.saturating_sub(TOOL_DESC_TRUNCATE_SUFFIX.len());
+                let mut end = keep.min(bytes.len());
+                while end > 0 && !desc.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let full_description = desc.clone();
+                description = Some(format!("{}{}", &desc[..end], TOOL_DESC_TRUNCATE_SUFFIX));
+                truncated_docs.push(ToolDoc {
+                    name: name.to_string(),
+                    full_description,
+                });
+            }
+        }
+        let parameters = parameters_raw
+            .and_then(Value::as_object)
+            .map(|_| strip_json_schema_meta(parameters_raw.unwrap()));
+        tools.push(EngineTool {
+            name: name.to_string(),
+            description,
+            parameters,
+        });
+    }
+    (tools, truncated_docs)
+}
+
+fn strip_json_schema_meta(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(strip_json_schema_meta).collect()),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                if matches!(
+                    key.as_str(),
+                    "$schema" | "$id" | "$defs" | "$ref" | "definitions" | "additionalProperties"
+                ) {
+                    continue;
+                }
+                out.insert(key.clone(), strip_json_schema_meta(value));
+            }
+            Value::Object(out)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn strip_risky_tool_schema_fields(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => {
+            Value::Array(items.iter().map(strip_risky_tool_schema_fields).collect())
+        }
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                if matches!(
+                    key.as_str(),
+                    "description"
+                        | "title"
+                        | "markdownDescription"
+                        | "examples"
+                        | "example"
+                        | "default"
+                        | "const"
+                        | "enum"
+                        | "$comment"
+                        | "enumDescriptions"
+                        | "markdownEnumDescriptions"
+                        | "oneOf"
+                        | "anyOf"
+                        | "allOf"
+                        | "not"
+                        | "propertyNames"
+                        | "patternProperties"
+                        | "unevaluatedProperties"
+                        | "unevaluatedItems"
+                        | "dependencies"
+                        | "dependentRequired"
+                        | "dependentSchemas"
+                        | "if"
+                        | "then"
+                        | "else"
+                        | "minProperties"
+                        | "maxProperties"
+                        | "contains"
+                        | "minContains"
+                        | "maxContains"
+                        | "contentMediaType"
+                        | "contentEncoding"
+                        | "contentSchema"
+                        | "deprecated"
+                        | "readOnly"
+                        | "writeOnly"
+                        | "$anchor"
+                        | "$vocabulary"
+                        | "$dynamicAnchor"
+                        | "$dynamicRef"
+                ) {
+                    continue;
+                }
+                out.insert(key.clone(), strip_risky_tool_schema_fields(value));
+            }
+            Value::Object(out)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn shorten_tool_descriptions_for_risk_client(tools: &mut [EngineTool]) {
+    for tool in tools {
+        tool.description = Some("Available tool.".to_string());
+        if let Some(parameters) = tool.parameters.as_mut() {
+            *parameters = strip_risky_tool_schema_fields(parameters);
+        }
+    }
+}
+
+fn replace_system_prompt_for_tool_description_risk(messages: &mut Vec<EngineMessage>) {
+    let mut replaced = false;
+    for message in messages.iter_mut() {
+        if message.role == "system" {
+            message.content = TOOL_DESCRIPTION_RISK_REPLACEMENT_SYSTEM.to_string();
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        messages.insert(
+            0,
+            EngineMessage {
+                role: "system".to_string(),
+                content: TOOL_DESCRIPTION_RISK_REPLACEMENT_SYSTEM.to_string(),
+                ..Default::default()
+            },
+        );
+    }
+}
+
+fn build_tool_doc_block(truncated_docs: &[ToolDoc]) -> String {
+    if truncated_docs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\n<tool_documentation>\nThe following tool descriptions were truncated for transport size limits. Use this section as the authoritative reference for full tool usage, edge cases, and examples:\n",
+    );
+    for doc in truncated_docs {
+        out.push_str("\n## ");
+        out.push_str(&doc.name);
+        out.push_str("\n\n");
+        out.push_str(&doc.full_description);
+        out.push_str("\n");
+    }
+    out.push_str("</tool_documentation>");
+    out
+}
+
+fn inject_tool_docs_into_system(
+    messages: Vec<EngineMessage>,
+    truncated_docs: &[ToolDoc],
+) -> Vec<EngineMessage> {
+    let block = build_tool_doc_block(truncated_docs);
+    if block.is_empty() {
+        return messages;
+    }
+    let mut out = messages;
+    for message in &mut out {
+        if message.role == "system" {
+            message.content.push_str(&block);
+            return out;
+        }
+    }
+    out.insert(
+        0,
+        EngineMessage {
+            role: "system".to_string(),
+            content: block.trim_start().to_string(),
+            ..Default::default()
+        },
+    );
+    out
+}
+
+fn isolate_tool_names(
+    tools: Vec<EngineTool>,
+    messages: Vec<EngineMessage>,
+    tool_choice: EngineToolChoice,
+    truncated_docs: Vec<ToolDoc>,
+    anonymous_tool_name_prefix: &str,
+) -> anyhow::Result<ToolIsolation> {
+    if tools.is_empty() {
+        return Ok(ToolIsolation {
+            tools,
+            messages,
+            tool_choice,
+            truncated_docs,
+            to_client_name: HashMap::new(),
+        });
+    }
+    let prefix = anonymous_tool_name_prefix.trim();
+    let prefix = if prefix.is_empty() {
+        DEFAULT_ANONYMOUS_TOOL_NAME_PREFIX
+    } else {
+        prefix
+    };
+    if !prefix
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(anyhow::anyhow!(
+            "匿名工具名前缀只能包含英文字母、数字、下划线或连字符"
+        ));
+    }
+    let mut to_upstream_name = HashMap::new();
+    let mut to_client_name = HashMap::new();
+    for (index, tool) in tools.iter().enumerate() {
+        let client_name = tool.name.clone();
+        let upstream_name = format!(
+            "{prefix}_{index}_{}",
+            short_hash(&client_name).chars().take(8).collect::<String>()
+        );
+        to_upstream_name.insert(client_name.clone(), upstream_name.clone());
+        to_client_name.insert(upstream_name, client_name);
+    }
+    let map_name = |name: &str| {
+        to_upstream_name
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    };
+    let isolated_tools = tools
+        .into_iter()
+        .map(|mut tool| {
+            tool.name = map_name(&tool.name);
+            tool
+        })
+        .collect::<Vec<_>>();
+    let isolated_messages = messages
+        .into_iter()
+        .map(|mut message| {
+            for tool_call in &mut message.tool_calls {
+                tool_call.name = map_name(&tool_call.name);
+            }
+            message
+        })
+        .collect::<Vec<_>>();
+    let isolated_tool_choice = match tool_choice {
+        EngineToolChoice::Function { name } => EngineToolChoice::Function {
+            name: map_name(&name),
+        },
+        other => other,
+    };
+    let isolated_truncated_docs = truncated_docs
+        .into_iter()
+        .map(|mut doc| {
+            doc.name = map_name(&doc.name);
+            doc
+        })
+        .collect::<Vec<_>>();
+    Ok(ToolIsolation {
+        tools: isolated_tools,
+        messages: isolated_messages,
+        tool_choice: isolated_tool_choice,
+        truncated_docs: isolated_truncated_docs,
+        to_client_name,
+    })
+}
+
+fn restore_tool_name(name: &str, to_client_name: &HashMap<String, String>) -> String {
+    to_client_name
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn sanitize_tool_choice(value: Option<&Value>) -> EngineToolChoice {
+    let Some(value) = value else {
+        return EngineToolChoice::Auto;
+    };
+    if let Some(kind) = value.as_str() {
+        return match kind {
+            "none" => EngineToolChoice::None,
+            "required" | "any" => EngineToolChoice::Required,
+            _ => EngineToolChoice::Auto,
+        };
+    }
+    let Some(obj) = value.as_object() else {
+        return EngineToolChoice::Auto;
+    };
+    match obj.get("type").and_then(Value::as_str).unwrap_or("auto") {
+        "none" => EngineToolChoice::None,
+        "required" | "any" => EngineToolChoice::Required,
+        "tool" | "function" => {
+            let name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    obj.get("function")
+                        .and_then(|value| value.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                EngineToolChoice::Auto
+            } else {
+                EngineToolChoice::Function { name }
+            }
+        }
+        _ => EngineToolChoice::Auto,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ToolChoiceDegrade {
+    tool_choice: EngineToolChoice,
+    messages: Vec<EngineMessage>,
+}
+
+fn degrade_tool_choice_for_upstream(
+    tool_choice: EngineToolChoice,
+    messages: Vec<EngineMessage>,
+    to_client_name: &HashMap<String, String>,
+) -> ToolChoiceDegrade {
+    match tool_choice {
+        EngineToolChoice::Auto | EngineToolChoice::None => ToolChoiceDegrade {
+            tool_choice,
+            messages,
+        },
+        EngineToolChoice::Required => ToolChoiceDegrade {
+            tool_choice: EngineToolChoice::Auto,
+            messages: append_system_hint(
+                messages,
+                "You MUST call one of the provided tools to answer this request. Do not respond with plain text - every response must include a tool call.",
+            ),
+        },
+        EngineToolChoice::Function { name } => {
+            let client_name = restore_tool_name(&name, to_client_name);
+            ToolChoiceDegrade {
+                tool_choice: EngineToolChoice::Auto,
+                messages: append_system_hint(
+                    messages,
+                    &format!(
+                        "You MUST call the tool named \"{}\" to answer this request. Do not call any other tool, and do not respond with plain text.",
+                        client_name
+                    ),
+                ),
+            }
+        }
+    }
+}
+
+fn append_system_hint(mut messages: Vec<EngineMessage>, hint: &str) -> Vec<EngineMessage> {
+    for message in &mut messages {
+        if message.role == "system" {
+            if !message.content.is_empty() {
+                message.content.push_str("\n\n");
+            }
+            message.content.push_str(hint);
+            return messages;
+        }
+    }
+    messages.insert(
+        0,
+        EngineMessage {
+            role: "system".to_string(),
+            content: hint.to_string(),
+            ..Default::default()
+        },
+    );
+    messages
+}
+
+fn sampling_params_from_request(payload: &MessagesRequest) -> Option<EngineSamplingParams> {
+    let params = EngineSamplingParams {
+        max_tokens: payload.max_tokens,
+        max_tool_calls: None,
+        temperature: payload.temperature,
+        top_p: payload.top_p,
+        top_k: payload.top_k,
+        frequency_penalty: payload.frequency_penalty,
+        presence_penalty: payload.presence_penalty,
+    };
+    if params.max_tokens.is_some()
+        || params.temperature.is_some()
+        || params.top_p.is_some()
+        || params.top_k.is_some()
+        || params.frequency_penalty.is_some()
+        || params.presence_penalty.is_some()
+    {
+        Some(params)
+    } else {
+        None
+    }
+}
+
+fn anthropic_sse_event(event: &'static str, data: Value) -> Event {
+    Event::default().event(event).data(data.to_string())
+}
+
+fn anthropic_text_delta(index: u64, text: String) -> Value {
+    json!({
+        "type": "content_block_delta",
+        "index": index,
+        "delta": { "type": "text_delta", "text": text }
+    })
+}
+
+fn switch_anthropic_block(
+    active_block: &mut Option<(String, u64)>,
+    next_block_index: &mut u64,
+    kind: &str,
+    content_block: Value,
+) -> (u64, Vec<Event>) {
+    if let Some((active_kind, index)) = active_block.as_ref() {
+        if active_kind == kind {
+            return (*index, Vec::new());
+        }
+    }
+    let mut events = Vec::new();
+    if let Some((_, index)) = active_block.take() {
+        events.push(anthropic_sse_event(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": index}),
+        ));
+    }
+    let index = *next_block_index;
+    *next_block_index += 1;
+    events.push(anthropic_sse_event(
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": content_block
+        }),
+    ));
+    *active_block = Some((kind.to_string(), index));
+    (index, events)
+}
+
 fn resolve_engine_model(model: &str) -> EngineModel {
     let key = model_alias(model);
     let model_uid = match key.as_str() {
@@ -2784,37 +5112,77 @@ fn resolve_engine_model(model: &str) -> EngineModel {
         "claude-4.5-opus" => Some("MODEL_CLAUDE_4_5_OPUS".to_string()),
         "claude-4.5-sonnet" => Some("MODEL_PRIVATE_2".to_string()),
         "claude-sonnet-4.6" => Some("claude-sonnet-4-6".to_string()),
+        "claude-sonnet-4.6-thinking" => Some("claude-sonnet-4-6-thinking".to_string()),
         "claude-opus-4.6" => Some("claude-opus-4-6".to_string()),
+        "claude-opus-4.6-thinking" => Some("claude-opus-4-6-thinking".to_string()),
         "claude-opus-4-7-low" => Some("claude-opus-4-7-low".to_string()),
         "claude-opus-4-7-high" => Some("claude-opus-4-7-high".to_string()),
         "claude-opus-4-7-xhigh" => Some("claude-opus-4-7-xhigh".to_string()),
         "claude-opus-4-7-max" => Some("claude-opus-4-7-max".to_string()),
         "claude-opus-4-7-medium" => Some("claude-opus-4-7-medium".to_string()),
+        "gpt-5-4-low" => Some("gpt-5-4-low".to_string()),
+        "gpt-5-3-codex-medium" => Some("gpt-5-3-codex-medium".to_string()),
+        "kimi-k2-5" => Some("kimi-k2-5".to_string()),
+        "glm-5-1" => Some("glm-5-1".to_string()),
+        "swe-1-6" => Some("swe-1-6".to_string()),
+        "swe-1-6-fast" => Some("swe-1-6-fast".to_string()),
         "gemini-2.5-flash" => Some("MODEL_GOOGLE_GEMINI_2_5_FLASH".to_string()),
+        "chat-gpt-4.1-mini-2025.04.14" => Some("MODEL_CHAT_GPT_4_1_MINI_2025_04_14".to_string()),
+        "chat-gpt-4.1-2025.04.14" => Some("MODEL_CHAT_GPT_4_1_2025_04_14".to_string()),
+        "gpt-5-nano" => Some("MODEL_GPT_5_NANO".to_string()),
         other => Some(other.to_string()),
     };
     EngineModel { id: key, model_uid }
 }
 
 fn model_alias(model: &str) -> String {
-    match model {
+    match model.trim() {
+        "claude-opus" => "claude-opus-4-7-medium".to_string(),
         "claude-opus-4-1" | "claude-opus-4.1" | "claude-opus-4-1-20250805" => {
             "claude-4.1-opus".to_string()
         }
         "claude-opus-4-5" | "claude-opus-4.5" | "claude-opus-4-5-20251101" => {
             "claude-4.5-opus".to_string()
         }
-        "claude-opus-4-6" | "claude-opus-4.6" => "claude-opus-4.6".to_string(),
-        "claude-sonnet-4-6" | "claude-sonnet-4.6" => "claude-sonnet-4.6".to_string(),
-        "claude-opus-4-7" | "claude-opus-4.7" | "claude-opus-4-7-latest" => {
-            "claude-opus-4-7-low".to_string()
+        "opus4.6" | "opus-4.6" | "opus-4-6" | "claude-opus-4-6" | "claude-opus-4.6" => {
+            "claude-opus-4.6".to_string()
         }
+        "claude-opus-4-6-thinking" | "claude-opus-4.6-thinking" => {
+            "claude-opus-4.6-thinking".to_string()
+        }
+        "claude-sonnet" => "claude-sonnet-4.6".to_string(),
+        "sonnet4.6" | "sonnet-4.6" | "sonnet-4-6" | "claude-sonnet-4-6" | "claude-sonnet-4.6" => {
+            "claude-sonnet-4.6".to_string()
+        }
+        "claude-sonnet-4-6-thinking" | "claude-sonnet-4.6-thinking" => {
+            "claude-sonnet-4.6-thinking".to_string()
+        }
+        "claude-opus-4-7" | "claude-opus-4.7" | "claude-opus-4-7-latest" => {
+            "claude-opus-4-7-medium".to_string()
+        }
+        "claude-opus-4.7-medium" => "claude-opus-4-7-medium".to_string(),
         "claude-opus-4.7-low" => "claude-opus-4-7-low".to_string(),
         "claude-opus-4.7-high" => "claude-opus-4-7-high".to_string(),
         "claude-opus-4.7-xhigh" => "claude-opus-4-7-xhigh".to_string(),
         "claude-opus-4.7-max" => "claude-opus-4-7-max".to_string(),
-        other => other.to_string(),
+        "gpt-5" | "gpt-5.4" | "gpt-5.4-low" => "gpt-5-4-low".to_string(),
+        "gpt-5-codex" | "gpt-5.3-codex" => "gpt-5-3-codex-medium".to_string(),
+        "kimi-k2" | "kimi-k2.5" => "kimi-k2-5".to_string(),
+        "glm-5" | "glm-5.1" => "glm-5-1".to_string(),
+        "swe-1" | "swe-1.6" => "swe-1-6".to_string(),
+        "swe-1.6-fast" => "swe-1-6-fast".to_string(),
+        other => other.trim().to_string(),
     }
+}
+
+fn log_model_resolution(trace_id: &str, requested_model: &str, engine_model: &EngineModel) {
+    tracing::info!(
+        trace_id = %trace_id,
+        requested_model = %requested_model,
+        resolved_model = %engine_model.id,
+        upstream_model = %engine_model.model_uid.as_deref().unwrap_or(&engine_model.id),
+        "model resolved for windsurf upstream"
+    );
 }
 
 async fn api_not_found() -> impl IntoResponse {
@@ -2883,6 +5251,36 @@ async fn run_login_job(
         )
         .await;
 
+        let existing_account = find_existing_login_account(&db, &entry.email).await;
+        if existing_account
+            .as_ref()
+            .is_some_and(|account| account.normal)
+        {
+            let account_id = existing_account.as_ref().map(|account| account.id);
+            let _ = sqlx::query(
+                "UPDATE login_jobs SET success_count=success_count+1, updated_at=? WHERE id=?",
+            )
+            .bind(now())
+            .bind(&job_id)
+            .execute(&db)
+            .await;
+            let _ = add_job_event(
+                &db,
+                &events,
+                &job_id,
+                "skipped",
+                json!({
+                    "index": index,
+                    "email": entry.email,
+                    "emailMasked": email_masked,
+                    "accountId": account_id,
+                    "message": "号池中已有可用账号，已跳过"
+                }),
+            )
+            .await;
+            continue;
+        }
+
         let result = match check_login_locked(&db, &entry.email).await {
             Some(seconds) => Err(WindsurfLoginError {
                 code: "ERR_EMAIL_LOCKED".to_string(),
@@ -2918,7 +5316,7 @@ async fn run_login_job(
                         "email": entry.email,
                         "emailMasked": email_masked,
                         "accountId": account_id,
-                        "message": "账号已添加"
+                        "message": if existing_account.is_some() { "已更新号池中的账号" } else { "账号已添加" }
                     }),
                 )
                 .await;
@@ -3269,6 +5667,32 @@ async fn upsert_logged_in_account(
     upsert_logged_in_account_with_options(db, entry, login, None, None, 0, 1).await
 }
 
+async fn find_existing_login_account(db: &SqlitePool, email: &str) -> Option<ExistingLoginAccount> {
+    let row = sqlx::query(
+        "SELECT id, status, error_count, last_error, rate_limited_until FROM accounts WHERE lower(email)=lower(?) ORDER BY id DESC LIMIT 1",
+    )
+    .bind(email)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+    let rate_limited_until = row.get::<Option<String>, _>("rate_limited_until");
+    let rate_limited = rate_limited_until.as_deref().is_some_and(|value| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map(|time| time.with_timezone(&Utc) > Utc::now())
+            .unwrap_or(false)
+    });
+    let status = row.get::<String, _>("status");
+    let normal = matches!(status.as_str(), "ready" | "active" | "ok")
+        && row.get::<i64, _>("error_count") == 0
+        && row.get::<Option<String>, _>("last_error").is_none()
+        && !rate_limited;
+    Some(ExistingLoginAccount {
+        id: row.get::<i64, _>("id"),
+        normal,
+    })
+}
+
 async fn upsert_logged_in_account_with_options(
     db: &SqlitePool,
     entry: &LoginEntry,
@@ -3297,7 +5721,7 @@ async fn upsert_logged_in_account_with_options(
     let label = label.unwrap_or(&login.name);
     if let Some(row) = row {
         let id = row.get::<i64, _>("id");
-        let _ = sqlx::query("UPDATE accounts SET label=?, status='ready', priority=?, max_concurrent=?, proxy_id=?, credentials_json=?, credential_mask=?, auth_method=?, api_server_url=?, last_login_at=?, last_error=NULL, updated_at=? WHERE id=?")
+        let _ = sqlx::query("UPDATE accounts SET label=?, status='ready', priority=?, max_concurrent=?, proxy_id=?, credentials_json=?, credential_mask=?, auth_method=?, api_server_url=?, last_login_at=?, error_count=0, last_error=NULL, rate_limited_until=NULL, rate_limit_probe_after=NULL, updated_at=? WHERE id=?")
             .bind(label)
             .bind(priority)
             .bind(max_concurrent)
@@ -3376,6 +5800,7 @@ fn account_credentials(row: &sqlx::sqlite::SqliteRow) -> Option<AccountCredentia
 
 async fn refresh_account_status(
     db: &SqlitePool,
+    data_dir: &PathBuf,
     id: i64,
     include_models: bool,
 ) -> Result<Value, WindsurfLoginError> {
@@ -3409,6 +5834,14 @@ async fn refresh_account_status(
             .unwrap_or_else(|| json!({ "configs": [] }))
     };
     let credits = normalize_user_status(&user_status);
+    if let Err(err) = write_account_status_snapshot(data_dir, id, &user_status) {
+        tracing::warn!(
+            account_id = id,
+            error = %redact_log_text(&err.to_string()),
+            "account status snapshot write failed"
+        );
+    }
+    let user_status_summary = account_user_status_summary(&credits);
     let tier = infer_tier(&credits);
     let available_models = normalize_models(&model_configs);
     let tier_models = if available_models
@@ -3439,7 +5872,7 @@ async fn refresh_account_status(
         .bind(rpm_used)
         .bind(rpm_limit)
         .bind(credits.to_string())
-        .bind(user_status.to_string())
+        .bind(user_status_summary.to_string())
         .bind(available_models.to_string())
         .bind(tier_models.to_string())
         .bind(&now_text)
@@ -3451,11 +5884,26 @@ async fn refresh_account_status(
     Ok(json!({
         "tier": tier,
         "credits": credits,
+        "userStatus": user_status_summary,
         "rateLimit": rate_limit,
         "availableModels": available_models,
         "tierModels": tier_models,
         "lastProbedAt": now_text
     }))
+}
+
+fn write_account_status_snapshot(data_dir: &PathBuf, account_id: i64, value: &Value) -> anyhow::Result<()> {
+    let dir = data_dir.join("account-status");
+    std::fs::create_dir_all(&dir).with_context(|| {
+        format!(
+            "failed to create account status directory {}",
+            dir.display()
+        )
+    })?;
+    let path = dir.join(format!("account-{account_id}.json"));
+    std::fs::write(&path, serde_json::to_vec(value)?)
+        .with_context(|| format!("failed to write account status snapshot {}", path.display()))?;
+    Ok(())
 }
 
 async fn mark_account_error(db: &SqlitePool, id: i64, message: &str) -> anyhow::Result<()> {
@@ -3555,14 +6003,66 @@ fn is_transient_upstream_error(message: &str) -> bool {
         || text.contains("超时")
 }
 
+async fn retry_budget_for_account_pool(
+    db: &SqlitePool,
+    capacity: &CapacitySettings,
+    trace_id: &str,
+    phase: &str,
+) -> i64 {
+    let configured = capacity.max_retries.max(0);
+    let ready_accounts = count_ready_accounts(db).await.unwrap_or_else(|err| {
+        tracing::warn!(
+            trace_id = %trace_id,
+            phase,
+            error = %redact_log_text(&err.to_string()),
+            "messages account retry budget count failed"
+        );
+        0
+    });
+    let budget = ready_accounts.saturating_sub(1).max(configured);
+    budget.clamp(1, MAX_DYNAMIC_ACCOUNT_RETRIES)
+}
+
+async fn count_ready_accounts(db: &SqlitePool) -> anyhow::Result<i64> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS count FROM accounts WHERE status IN ('ready', 'active', 'ok')",
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(row.get::<i64, _>("count"))
+}
+
+fn is_retryable_before_output_error(message: &str) -> bool {
+    !is_fatal_account_error(message)
+        && (is_upstream_rate_limit_error(message)
+            || is_transient_upstream_error(message)
+            || is_quota_exhausted_error(message))
+}
+
+fn is_quota_exhausted_error(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    (text.contains("quota") && (text.contains("exhausted") || text.contains("usage")))
+        || text.contains("weekly usage quota")
+        || text.contains("usage quota has been exhausted")
+}
+
 fn classify_upstream_rate_limit(
     message: &str,
     capacity: &CapacitySettings,
 ) -> Option<UpstreamRateLimit> {
     let text = message.to_ascii_lowercase();
+    if is_quota_exhausted_error(message) {
+        return Some(UpstreamRateLimit {
+            scope: UpstreamRateLimitScope::Account,
+            retry_after_secs: capacity.suspicious_cooldown_secs,
+        });
+    }
     let retry_after_secs = parse_retry_after_secs(message);
     if text.contains("reached message rate limit for this model")
         || text.contains("message rate limit for this model")
+        || text.contains("resource_exhausted")
+        || text.contains("third-party model provider is experiencing issues")
+        || text.contains("model provider is experiencing issues")
     {
         return Some(UpstreamRateLimit {
             scope: UpstreamRateLimitScope::Model,
@@ -3582,9 +6082,76 @@ fn classify_upstream_rate_limit(
     None
 }
 
+fn classify_account_failure(message: &str, capacity: &CapacitySettings) -> AccountFailureAction {
+    if let Some(limit) = classify_upstream_rate_limit(message, capacity) {
+        return AccountFailureAction::RateLimit(limit);
+    }
+    let text = message.to_ascii_lowercase();
+    if text.contains("checkchatcapacity returned no capacity") {
+        return AccountFailureAction::RateLimit(UpstreamRateLimit {
+            scope: UpstreamRateLimitScope::Model,
+            retry_after_secs: capacity.model_cooldown_secs,
+        });
+    }
+    if text.contains("checkusermessageratelimit returned no capacity") {
+        return AccountFailureAction::RateLimit(UpstreamRateLimit {
+            scope: UpstreamRateLimitScope::Account,
+            retry_after_secs: capacity.suspicious_cooldown_secs,
+        });
+    }
+    if is_fatal_account_error(message) {
+        return AccountFailureAction::FatalAccountError;
+    }
+    if is_transient_upstream_error(message) {
+        return AccountFailureAction::TransientRecordOnly;
+    }
+    AccountFailureAction::ReleaseOnly
+}
+
+fn is_fatal_account_error(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    if text.contains("your windsurf version is out of date")
+        || text.contains("invalid_argument")
+        || text.contains("internal error")
+        || text.contains("an internal error occurred")
+        || text.contains("请求构建失败")
+        || text.contains("protobuf")
+        || text.contains("trailer 错误")
+    {
+        return false;
+    }
+    let auth_failure = text.contains("unauthenticated")
+        || text.contains("invalid api key")
+        || text.contains("invalid_api_key")
+        || text.contains("invalid token")
+        || text.contains("jwt expired")
+        || text.contains("authorization failed");
+    let account_failure = text.contains("account disabled")
+        || text.contains("account banned")
+        || text.contains("account suspended")
+        || text.contains("subscription expired")
+        || text.contains("plan expired")
+        || text.contains("credential")
+        || text.contains("凭据");
+    let permission_account_failure = text.contains("permission_denied")
+        && (text.contains("subscription")
+            || text.contains("plan")
+            || text.contains("account")
+            || text.contains("credential")
+            || text.contains("api key")
+            || text.contains("unauthorized"));
+    auth_failure || account_failure || permission_account_failure
+}
+
 fn is_upstream_rate_limit_error(message: &str) -> bool {
     let text = message.to_ascii_lowercase();
-    text.contains("rate limit") || text.contains("rate_limit") || text.contains("global rate limit")
+    text.contains("rate limit")
+        || text.contains("rate_limit")
+        || text.contains("global rate limit")
+        || text.contains("resource_exhausted")
+        || text.contains("third-party model provider is experiencing issues")
+        || text.contains("model provider is experiencing issues")
+        || is_quota_exhausted_error(message)
 }
 
 fn parse_retry_after_secs(text: &str) -> Option<i64> {
@@ -3698,6 +6265,55 @@ fn upstream_messages_error_response(message: &str) -> Response {
     }
 }
 
+fn preflight_failure_message(failure: &EnginePreflightFailure) -> String {
+    if let Some(retry_after_secs) = failure.retry_after_secs {
+        format!(
+            "Windsurf preflight {} failed: {}. retry after: {}s",
+            failure.phase, failure.message, retry_after_secs
+        )
+    } else {
+        format!(
+            "Windsurf preflight {} failed: {}",
+            failure.phase, failure.message
+        )
+    }
+}
+
+fn acquire_error_message(error: &AcquireError) -> String {
+    match error {
+        AcquireError::TemporarilyUnavailable {
+            reason,
+            upstream_error,
+            ..
+        } => upstream_error.clone().unwrap_or_else(|| reason.clone()),
+        AcquireError::NoAccount => "没有可用账号".to_string(),
+        AcquireError::Db(err) => err.to_string(),
+    }
+}
+
+fn acquire_error_response(acquire_error: AcquireError) -> Response {
+    match acquire_error {
+        AcquireError::TemporarilyUnavailable {
+            retry_after_secs,
+            reason,
+            upstream_error,
+        } => rate_limited_response(
+            upstream_error.as_deref().unwrap_or(&reason),
+            retry_after_secs,
+        ),
+        AcquireError::NoAccount => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pool_exhausted",
+            "没有可用账号",
+        ),
+        AcquireError::Db(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "scheduler_error",
+            &err.to_string(),
+        ),
+    }
+}
+
 impl AccountScheduler {
     fn new(
         db: SqlitePool,
@@ -3714,6 +6330,8 @@ impl AccountScheduler {
     async fn acquire(
         &self,
         model: &str,
+        resolved_model: Option<&str>,
+        upstream_model: Option<&str>,
         caller_key: Option<String>,
     ) -> Result<AccountLease, AcquireError> {
         self.cleanup_expired().await.map_err(AcquireError::Db)?;
@@ -3740,7 +6358,14 @@ impl AccountScheduler {
                 .map_err(AcquireError::Db)?
             {
                 match self
-                    .try_reserve_account(account_id, model, caller_key.clone(), true)
+                    .try_reserve_account(
+                        account_id,
+                        model,
+                        resolved_model,
+                        upstream_model,
+                        caller_key.clone(),
+                        true,
+                    )
                     .await
                 {
                     Ok(Some(lease)) => return Ok(lease),
@@ -3764,7 +6389,7 @@ impl AccountScheduler {
         for row in rows {
             let account = scheduler_account_from_row(&row);
             let availability = self
-                .availability(&account, model)
+                .availability(&account, model, resolved_model, upstream_model)
                 .await
                 .map_err(AcquireError::Db)?;
             if availability.available {
@@ -3820,6 +6445,35 @@ impl AccountScheduler {
         })
     }
 
+    async fn acquire_preflighted(
+        &self,
+        engine: &RemoteApiEngine,
+        trace_id: &str,
+        model: &str,
+        engine_model: &EngineModel,
+        caller_key: Option<String>,
+    ) -> Result<(AccountLease, EngineAccount), AcquireError> {
+        let _ = (engine, trace_id);
+        let upstream_model = engine_model
+            .model_uid
+            .as_deref()
+            .unwrap_or(&engine_model.id);
+        let lease = self
+            .acquire(
+                model,
+                Some(&engine_model.id),
+                Some(upstream_model),
+                caller_key,
+            )
+            .await?;
+        let engine_account = EngineAccount {
+            api_key: lease.api_key.clone(),
+            jwt_token: lease.jwt_token.clone(),
+            proxy_url: proxy_url_for_account(&self.db, lease.account_id).await,
+        };
+        Ok((lease, engine_account))
+    }
+
     async fn mark_success(&self, lease: &mut AccountLease) -> anyhow::Result<()> {
         if let Some(caller) = lease.caller_key.as_deref() {
             self.set_sticky(caller, &lease.model, lease.account_id, &lease.api_key)
@@ -3856,26 +6510,39 @@ impl AccountScheduler {
     }
 
     async fn mark_failure(&self, lease: &mut AccountLease, message: &str) -> anyhow::Result<()> {
-        if let Some(limit) = classify_upstream_rate_limit(message, &self.capacity) {
-            let model = match limit.scope {
-                UpstreamRateLimitScope::Model => Some(lease.model.clone()),
-                UpstreamRateLimitScope::Account => None,
-            };
-            self.mark_rate_limited(lease, model.as_deref(), limit.retry_after_secs, message)
+        match classify_account_failure(message, &self.capacity) {
+            AccountFailureAction::RateLimit(limit) => {
+                let model = match limit.scope {
+                    UpstreamRateLimitScope::Model => Some(lease.model.clone()),
+                    UpstreamRateLimitScope::Account => None,
+                };
+                self.mark_rate_limited(lease, model.as_deref(), limit.retry_after_secs, message)
+                    .await
+            }
+            AccountFailureAction::FatalAccountError => self.mark_error(lease, message).await,
+            AccountFailureAction::TransientRecordOnly => {
+                mark_account_transient_error_with_events(
+                    &self.db,
+                    &self.events,
+                    lease.account_id,
+                    message,
+                )
                 .await?;
-            return Ok(());
-        }
-        if is_transient_upstream_error(message) {
-            mark_account_transient_error_with_events(
-                &self.db,
-                &self.events,
-                lease.account_id,
-                message,
-            )
-            .await?;
-            self.release(lease).await
-        } else {
-            self.mark_error(lease, message).await
+                self.release(lease).await
+            }
+            AccountFailureAction::ReleaseOnly => {
+                emit_admin_event(
+                    &self.events,
+                    "account_request_released",
+                    json!({
+                        "accountId": lease.account_id,
+                        "email": lease.email,
+                        "model": lease.model,
+                        "message": message
+                    }),
+                );
+                self.release(lease).await
+            }
         }
     }
 
@@ -4015,6 +6682,8 @@ impl AccountScheduler {
         &self,
         account_id: i64,
         model: &str,
+        resolved_model: Option<&str>,
+        upstream_model: Option<&str>,
         caller_key: Option<String>,
         sticky: bool,
     ) -> anyhow::Result<Option<AccountLease>> {
@@ -4025,18 +6694,31 @@ impl AccountScheduler {
         else {
             return Ok(None);
         };
-        self.try_reserve_loaded_account(scheduler_account_from_row(&row), model, caller_key, sticky)
-            .await
+        self.try_reserve_loaded_account(
+            scheduler_account_from_row(&row),
+            model,
+            resolved_model,
+            upstream_model,
+            caller_key,
+            sticky,
+        )
+        .await
     }
 
     async fn try_reserve_loaded_account(
         &self,
         account: SchedulerAccount,
         model: &str,
+        resolved_model: Option<&str>,
+        upstream_model: Option<&str>,
         caller_key: Option<String>,
         sticky: bool,
     ) -> anyhow::Result<Option<AccountLease>> {
-        if !self.availability(&account, model).await?.available {
+        if !self
+            .availability(&account, model, resolved_model, upstream_model)
+            .await?
+            .available
+        {
             return Ok(None);
         }
         self.reserve_loaded_account(account, model, caller_key, sticky)
@@ -4105,6 +6787,8 @@ impl AccountScheduler {
         &self,
         account: &SchedulerAccount,
         model: &str,
+        resolved_model: Option<&str>,
+        upstream_model: Option<&str>,
     ) -> anyhow::Result<AccountAvailability> {
         if !["ready", "active", "ok"].contains(&account.status.as_str()) {
             return Ok(AccountAvailability::unavailable(
@@ -4112,13 +6796,16 @@ impl AccountScheduler {
                 60,
             ));
         }
-        self.availability_without_status(account, model).await
+        self.availability_without_status(account, model, resolved_model, upstream_model)
+            .await
     }
 
     async fn availability_without_status(
         &self,
         account: &SchedulerAccount,
         model: &str,
+        resolved_model: Option<&str>,
+        upstream_model: Option<&str>,
     ) -> anyhow::Result<AccountAvailability> {
         let now_utc = Utc::now();
         let account_limit = if account.max_concurrent > 0 {
@@ -4164,9 +6851,16 @@ impl AccountScheduler {
                 limit.reason,
             ));
         }
-        if account.rpm_limit <= 0 || account.tier == "expired" {
+        let effective_tier = effective_account_tier(account);
+        if account.rpm_limit <= 0 || effective_tier == "expired" {
             return Ok(AccountAvailability::unavailable(
                 AvailabilityKind::TierExpired,
+                60,
+            ));
+        }
+        if !account_supports_model(account, model, resolved_model, upstream_model) {
+            return Ok(AccountAvailability::unavailable(
+                AvailabilityKind::ModelBlocked,
                 60,
             ));
         }
@@ -4447,6 +7141,7 @@ fn scheduler_account_from_row(row: &sqlx::sqlite::SqliteRow) -> SchedulerAccount
         email: row.get::<String, _>("email"),
         status: row.get::<String, _>("status"),
         tier: row.get::<String, _>("tier"),
+        tier_manual: row.get::<i64, _>("tier_manual") != 0,
         max_concurrent: row.get::<i64, _>("max_concurrent"),
         current_concurrent: row.get::<i64, _>("current_concurrent"),
         last_used_at: row.get::<Option<String>, _>("last_used_at"),
@@ -4454,6 +7149,9 @@ fn scheduler_account_from_row(row: &sqlx::sqlite::SqliteRow) -> SchedulerAccount
         rate_limit_probe_after: row.get::<Option<String>, _>("rate_limit_probe_after"),
         rpm_limit: row.get::<i64, _>("rpm_limit"),
         credits_json: row.get::<Option<String>, _>("credits_json"),
+        user_status_json: row.get::<Option<String>, _>("user_status_json"),
+        available_models_json: row.get::<Option<String>, _>("available_models_json"),
+        tier_models_json: row.get::<Option<String>, _>("tier_models_json"),
         blocked_models_json: row.get::<Option<String>, _>("blocked_models_json"),
         credentials_json: row.get::<Option<String>, _>("credentials_json"),
     }
@@ -4502,6 +7200,118 @@ fn model_blocked(raw: Option<&str>, model: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn effective_account_tier(account: &SchedulerAccount) -> String {
+    if account.tier_manual {
+        return account.tier.clone();
+    }
+    infer_tier_from_raw(account.credits_json.as_deref())
+        .or_else(|| infer_tier_from_raw(account.user_status_json.as_deref()))
+        .unwrap_or_else(|| account.tier.clone())
+}
+
+fn effective_row_tier(row: &sqlx::sqlite::SqliteRow) -> String {
+    if row.get::<i64, _>("tier_manual") != 0 {
+        return row.get::<String, _>("tier");
+    }
+    let credits_json = row.get::<Option<String>, _>("credits_json");
+    let user_status_json = row.get::<Option<String>, _>("user_status_json");
+    infer_tier_from_raw(credits_json.as_deref())
+        .or_else(|| infer_tier_from_raw(user_status_json.as_deref()))
+        .unwrap_or_else(|| row.get::<String, _>("tier"))
+}
+
+fn infer_tier_from_raw(raw: Option<&str>) -> Option<String> {
+    let value = serde_json::from_str::<Value>(raw?).ok()?;
+    let tier = infer_tier(&value);
+    (tier != "unknown").then_some(tier)
+}
+
+fn account_supports_model(
+    account: &SchedulerAccount,
+    requested_model: &str,
+    resolved_model: Option<&str>,
+    upstream_model: Option<&str>,
+) -> bool {
+    let Some(models) = account_model_snapshot(account) else {
+        return true;
+    };
+    if models.is_empty() {
+        return true;
+    }
+    let aliases = model_match_aliases(requested_model, resolved_model, upstream_model);
+    models
+        .iter()
+        .any(|model| model_entry_matches_aliases(model, &aliases))
+}
+
+fn account_model_snapshot(account: &SchedulerAccount) -> Option<Vec<Value>> {
+    parse_model_list(account.available_models_json.as_deref())
+        .filter(|models| !models.is_empty())
+        .or_else(|| parse_model_list(account.tier_models_json.as_deref()))
+}
+
+fn parse_model_list(raw: Option<&str>) -> Option<Vec<Value>> {
+    let value = serde_json::from_str::<Value>(raw?).ok()?;
+    let items = value.as_array()?;
+    let models = items
+        .iter()
+        .filter(|item| model_entry_names(item).iter().any(|name| !name.is_empty()))
+        .cloned()
+        .collect::<Vec<_>>();
+    Some(models)
+}
+
+fn model_match_aliases(
+    requested_model: &str,
+    resolved_model: Option<&str>,
+    upstream_model: Option<&str>,
+) -> std::collections::HashSet<String> {
+    let mut aliases = std::collections::HashSet::new();
+    for value in [
+        requested_model,
+        resolved_model.unwrap_or(""),
+        upstream_model.unwrap_or(""),
+    ] {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        aliases.insert(trimmed.to_ascii_lowercase());
+        aliases.insert(model_alias(trimmed).to_ascii_lowercase());
+        aliases.insert(trimmed.replace('.', "-").to_ascii_lowercase());
+        aliases.insert(trimmed.replace('-', ".").to_ascii_lowercase());
+    }
+    aliases
+}
+
+fn model_entry_matches_aliases(model: &Value, aliases: &std::collections::HashSet<String>) -> bool {
+    model_entry_names(model)
+        .into_iter()
+        .any(|name| aliases.contains(&name.to_ascii_lowercase()))
+}
+
+fn model_entry_names(model: &Value) -> Vec<String> {
+    if let Some(value) = model.as_str() {
+        return vec![value.to_string()];
+    }
+    [
+        "id",
+        "shortName",
+        "short_name",
+        "model",
+        "modelName",
+        "modelUid",
+        "model_uid",
+        "name",
+        "label",
+    ]
+    .iter()
+    .filter_map(|key| model.get(*key).and_then(Value::as_str))
+    .filter(|value| !value.trim().is_empty())
+    .map(str::to_string)
+    .collect()
+}
+
 fn quota_score(account: &SchedulerAccount) -> i64 {
     let Some(raw) = account.credits_json.as_deref() else {
         return 100;
@@ -4528,6 +7338,13 @@ fn rpm_remaining_ratio(used: i64, limit: i64) -> i64 {
 }
 
 fn extract_caller_key(headers: &HeaderMap, payload: &Value) -> Option<String> {
+    if let Some(value) = headers
+        .get("x-claude-code-session-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(format!("claude:{value}"));
+    }
     if let Some(user_id) = payload
         .pointer("/metadata/user_id")
         .and_then(Value::as_str)
@@ -4555,7 +7372,6 @@ fn extract_caller_key(headers: &HeaderMap, payload: &Value) -> Option<String> {
     }
     for (name, prefix) in [
         ("x-session-id", "header"),
-        ("x-claude-code-session-id", "claude"),
         ("session_id", "codex"),
         ("x-amp-thread-id", "amp"),
         ("x-client-request-id", "clientreq"),
@@ -4577,6 +7393,33 @@ fn extract_caller_key(headers: &HeaderMap, payload: &Value) -> Option<String> {
     } else {
         None
     }
+}
+
+fn branch_gate_key(
+    caller_key: Option<&str>,
+    model: &str,
+    messages: &[EngineMessage],
+) -> Option<String> {
+    let caller_key = caller_key?;
+    Some(format!(
+        "{}:{}:{}",
+        caller_key,
+        model_alias(model),
+        branch_message_fingerprint(messages)
+    ))
+}
+
+fn branch_message_fingerprint(messages: &[EngineMessage]) -> String {
+    let original_user = messages
+        .iter()
+        .find(|message| message.role == "user" && !is_tool_result_message(message))
+        .map(|message| message.content.as_str())
+        .unwrap_or("");
+    short_hash(original_user)
+}
+
+fn is_tool_result_message(message: &EngineMessage) -> bool {
+    message.role == "tool" || message.content.trim_start().starts_with("<tool_result")
 }
 
 async fn bind_trace_account(
@@ -4795,7 +7638,9 @@ fn infer_tier(credits: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_lowercase();
-    if plan_name.contains("pro") || plan_name.contains("trial") || plan_name.contains("team") {
+    if plan_name.contains("trial") {
+        "trial".to_string()
+    } else if plan_name.contains("pro") || plan_name.contains("team") {
         "pro".to_string()
     } else if plan_name.contains("free") {
         "free".to_string()
@@ -5636,6 +8481,9 @@ fn account_json(
     let full_key = account_api_key(&row);
     let available_models = parse_json("available_models_json", json!([]));
     let stored_tier_models = parse_json("tier_models_json", json!([]));
+    let credits = parse_json("credits_json", Value::Null);
+    let user_status_summary = account_user_status_summary(&credits);
+    let effective_tier = effective_row_tier(&row);
     let tier_models = if is_legacy_static_tier_models(&stored_tier_models)
         && available_models
             .as_array()
@@ -5650,7 +8498,8 @@ fn account_json(
         "email": row.get::<String, _>("email"),
         "label": row.get::<Option<String>, _>("label"),
         "status": row.get::<String, _>("status"),
-        "tier": row.get::<String, _>("tier"),
+        "tier": effective_tier,
+        "storedTier": row.get::<String, _>("tier"),
         "tierManual": row.get::<i64, _>("tier_manual") != 0,
         "errorCount": row.get::<i64, _>("error_count"),
         "priority": row.get::<i64, _>("priority"),
@@ -5669,8 +8518,8 @@ fn account_json(
         }),
         "rpmUsed": row.get::<i64, _>("rpm_used"),
         "rpmLimit": row.get::<i64, _>("rpm_limit"),
-        "credits": parse_json("credits_json", Value::Null),
-        "userStatus": parse_json("user_status_json", Value::Null),
+        "credits": credits,
+        "userStatus": user_status_summary,
         "availableModels": available_models,
         "tierModels": tier_models,
         "blockedModels": parse_json("blocked_models_json", json!([])),
@@ -5690,6 +8539,16 @@ fn account_json(
         "lastLoginAt": row.get::<Option<String>, _>("last_login_at"),
         "createdAt": row.get::<String, _>("created_at"),
         "updatedAt": row.get::<String, _>("updated_at")
+    })
+}
+
+fn account_user_status_summary(credits: &Value) -> Value {
+    if credits.is_null() {
+        return Value::Null;
+    }
+    json!({
+        "planName": credits.get("planName").cloned().unwrap_or(Value::Null),
+        "trialEndMs": credits.get("trialEndMs").cloned().unwrap_or(Value::Null)
     })
 }
 
@@ -5734,18 +8593,89 @@ async fn create_trace(
 
 async fn add_trace_chunk(
     db: &SqlitePool,
+    data_dir: &PathBuf,
     trace_id: &str,
     layer: &str,
     payload: &Value,
 ) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO request_trace_chunks (trace_id, layer, payload, created_at) VALUES (?, ?, ?, ?)")
+    let payload_text = payload.to_string();
+    let payload_size = i64::try_from(payload_text.len()).unwrap_or(i64::MAX);
+    let payload_preview = trace_payload_preview(&payload_text);
+    let payload_path = match write_trace_payload(data_dir, trace_id, &payload_text).await {
+        Ok(path) => Some(path),
+        Err(err) => {
+            tracing::warn!(
+                trace_id,
+                error = %redact_log_text(&err.to_string()),
+                "trace payload file write failed"
+            );
+            None
+        }
+    };
+    sqlx::query("INSERT INTO request_trace_chunks (trace_id, layer, payload, payload_path, payload_size, created_at) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(trace_id)
         .bind(layer)
-        .bind(payload.to_string())
+        .bind(payload_preview)
+        .bind(payload_path)
+        .bind(payload_size)
         .bind(now())
         .execute(db)
         .await?;
     Ok(())
+}
+
+async fn write_trace_payload(
+    data_dir: &PathBuf,
+    trace_id: &str,
+    payload: &str,
+) -> anyhow::Result<String> {
+    let relative_dir = PathBuf::from("traces").join(trace_id);
+    let dir = data_dir.join(&relative_dir);
+    tokio::fs::create_dir_all(&dir).await.with_context(|| {
+        format!("failed to create trace payload directory {}", dir.display())
+    })?;
+    let file_name = format!("{}.json", Uuid::new_v4().simple());
+    let relative_path = relative_dir.join(file_name);
+    let path = data_dir.join(&relative_path);
+    tokio::fs::write(&path, payload)
+        .await
+        .with_context(|| format!("failed to write trace payload {}", path.display()))?;
+    Ok(relative_path.to_string_lossy().to_string())
+}
+
+fn read_trace_payload(data_dir: &PathBuf, relative_path: &str) -> anyhow::Result<String> {
+    let path = safe_data_relative_path(data_dir, relative_path)?;
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read trace payload {}", path.display()))
+}
+
+fn safe_data_relative_path(data_dir: &PathBuf, relative_path: &str) -> anyhow::Result<PathBuf> {
+    let relative = PathBuf::from(relative_path);
+    if relative.is_absolute() {
+        anyhow::bail!("trace payload path must be relative");
+    }
+    for component in relative.components() {
+        match component {
+            Component::Normal(_) => {}
+            _ => anyhow::bail!("trace payload path contains invalid component"),
+        }
+    }
+    Ok(data_dir.join(relative))
+}
+
+fn trace_payload_preview(payload: &str) -> String {
+    let mut preview = String::new();
+    let mut chars = payload.chars();
+    for _ in 0..TRACE_PAYLOAD_PREVIEW_CHARS {
+        let Some(ch) = chars.next() else {
+            return preview;
+        };
+        preview.push(ch);
+    }
+    if chars.next().is_some() {
+        preview.push_str("\n...");
+    }
+    preview
 }
 
 async fn finish_trace(
@@ -5791,6 +8721,448 @@ mod tests {
         );
     }
 
+    #[test]
+    fn release_only_for_request_or_client_compat_errors() {
+        let settings = CapacitySettings::default();
+        let invalid_argument = "Windsurf 远端 trailer 错误: {\"error\":{\"code\":\"invalid_argument\",\"message\":\"an internal error occurred (trace ID: abc)\"}}";
+        let out_of_date = "Windsurf 远端 trailer 错误: {\"error\":{\"code\":\"failed_precondition\",\"message\":\"Your Windsurf version is out of date. Please update to the latest version to continue.\"}}";
+        assert_eq!(
+            classify_account_failure(invalid_argument, &settings),
+            AccountFailureAction::ReleaseOnly
+        );
+        assert_eq!(
+            classify_account_failure(out_of_date, &settings),
+            AccountFailureAction::ReleaseOnly
+        );
+    }
+
+    #[test]
+    fn preserves_rate_limit_classification_for_scheduler() {
+        let settings = CapacitySettings::default();
+        assert_eq!(
+            classify_account_failure(
+                "Reached message rate limit for this model. Resets in: 2m3s",
+                &settings,
+            ),
+            AccountFailureAction::RateLimit(UpstreamRateLimit {
+                scope: UpstreamRateLimitScope::Model,
+                retry_after_secs: 123,
+            })
+        );
+        assert_eq!(
+            classify_account_failure("global rate limit, retry after: 30s", &settings),
+            AccountFailureAction::RateLimit(UpstreamRateLimit {
+                scope: UpstreamRateLimitScope::Account,
+                retry_after_secs: 30,
+            })
+        );
+    }
+
+    #[test]
+    fn preflight_failures_are_rate_limited_for_retry() {
+        let settings = CapacitySettings::default();
+        assert_eq!(
+            classify_account_failure(
+                "Windsurf preflight rate-limit failed: CheckUserMessageRateLimit returned no capacity for claude-opus-4-7-medium",
+                &settings,
+            ),
+            AccountFailureAction::RateLimit(UpstreamRateLimit {
+                scope: UpstreamRateLimitScope::Account,
+                retry_after_secs: settings.suspicious_cooldown_secs,
+            })
+        );
+        assert_eq!(
+            classify_account_failure(
+                "Windsurf preflight capacity failed: CheckChatCapacity returned no capacity",
+                &settings,
+            ),
+            AccountFailureAction::RateLimit(UpstreamRateLimit {
+                scope: UpstreamRateLimitScope::Model,
+                retry_after_secs: settings.model_cooldown_secs,
+            })
+        );
+    }
+
+    #[test]
+    fn resource_exhausted_provider_errors_are_model_cooldown() {
+        let settings = CapacitySettings::default();
+        let message = "Windsurf 远端 trailer 错误: {\"error\":{\"code\":\"resource_exhausted\",\"message\":\"The third-party model provider is experiencing issues and is currently not available. Please try this model again later.\"}}";
+        assert_eq!(
+            classify_account_failure(message, &settings),
+            AccountFailureAction::RateLimit(UpstreamRateLimit {
+                scope: UpstreamRateLimitScope::Model,
+                retry_after_secs: settings.model_cooldown_secs,
+            })
+        );
+        assert!(is_upstream_rate_limit_error(message));
+    }
+
+    #[test]
+    fn weekly_quota_errors_are_retryable_account_limits() {
+        let settings = CapacitySettings::default();
+        let message = "Cascade 错误: Your weekly usage quota has been exhausted. Please ensure Windsurf is up to date for the best experience.";
+        assert!(is_retryable_before_output_error(message));
+        assert!(is_upstream_rate_limit_error(message));
+        assert_eq!(
+            classify_account_failure(message, &settings),
+            AccountFailureAction::RateLimit(UpstreamRateLimit {
+                scope: UpstreamRateLimitScope::Account,
+                retry_after_secs: settings.suspicious_cooldown_secs,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_budget_scales_with_ready_account_pool() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&db, &PathBuf::from(".data")).await.unwrap();
+        for id in 0..6 {
+            sqlx::query("INSERT INTO accounts (email, status, credentials_json, created_at, updated_at) VALUES (?, 'ready', ?, ?, ?)")
+                .bind(format!("a{id}@example.com"))
+                .bind(json!({ "apiKey": format!("k{id}") }).to_string())
+                .bind(now())
+                .bind(now())
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        let mut settings = CapacitySettings::default();
+        settings.max_retries = 1;
+        assert_eq!(
+            retry_budget_for_account_pool(&db, &settings, "test", "test").await,
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_gate_suppresses_same_session_no_tool_side_branch() {
+        let gate = BranchGate::default();
+        let messages = vec![EngineMessage {
+            role: "user".to_string(),
+            content: "看看项目".to_string(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            gate.check(Some("claude:s1:model:req"), 25, &messages).await,
+            BranchGateDecision::Allow
+        );
+        assert_eq!(
+            gate.check(Some("claude:s1:model:req"), 0, &messages).await,
+            BranchGateDecision::SuppressNoToolBranch
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_gate_keeps_other_sessions_isolated() {
+        let gate = BranchGate::default();
+        let messages = vec![EngineMessage {
+            role: "user".to_string(),
+            content: "看看项目".to_string(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            gate.check(Some("claude:s1:model:req"), 25, &messages).await,
+            BranchGateDecision::Allow
+        );
+        assert_eq!(
+            gate.check(Some("claude:s2:model:req"), 0, &messages).await,
+            BranchGateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn model_snapshot_matches_resolved_and_upstream_aliases() {
+        let account = SchedulerAccount {
+            id: 1,
+            email: "a@example.com".to_string(),
+            status: "ready".to_string(),
+            tier: "pro".to_string(),
+            tier_manual: false,
+            max_concurrent: 1,
+            current_concurrent: 0,
+            last_used_at: None,
+            rate_limited_until: None,
+            rate_limit_probe_after: None,
+            rpm_limit: 60,
+            credits_json: None,
+            user_status_json: None,
+            available_models_json: Some(
+                json!([{ "id": "claude-opus-4-7-medium", "shortName": "opus47" }]).to_string(),
+            ),
+            tier_models_json: None,
+            blocked_models_json: None,
+            credentials_json: Some(json!({ "apiKey": "k" }).to_string()),
+        };
+        assert!(account_supports_model(
+            &account,
+            "claude-opus-4.7",
+            Some("claude-opus-4-7-medium"),
+            Some("claude-opus-4-7-medium"),
+        ));
+        assert!(!account_supports_model(
+            &account,
+            "claude-sonnet-4.6",
+            Some("claude-sonnet-4.6"),
+            Some("claude-sonnet-4-6"),
+        ));
+    }
+
+    #[test]
+    fn windsurf_thinking_is_sent_as_text_delta() {
+        let delta = anthropic_text_delta(2, "正在分析项目结构".to_string());
+        assert_eq!(delta["type"], "content_block_delta");
+        assert_eq!(delta["index"], 2);
+        assert_eq!(delta["delta"]["type"], "text_delta");
+        assert_eq!(delta["delta"]["text"], "正在分析项目结构");
+        assert!(delta["delta"].get("thinking").is_none());
+        assert!(delta["delta"].get("signature").is_none());
+    }
+
+    #[test]
+    fn effective_tier_uses_plan_snapshot_for_old_rows() {
+        let account = SchedulerAccount {
+            id: 1,
+            email: "trial@example.com".to_string(),
+            status: "ready".to_string(),
+            tier: "pro".to_string(),
+            tier_manual: false,
+            max_concurrent: 1,
+            current_concurrent: 0,
+            last_used_at: None,
+            rate_limited_until: None,
+            rate_limit_probe_after: None,
+            rpm_limit: 60,
+            credits_json: Some(json!({ "planName": "Trial" }).to_string()),
+            user_status_json: None,
+            available_models_json: None,
+            tier_models_json: None,
+            blocked_models_json: None,
+            credentials_json: Some(json!({ "apiKey": "k" }).to_string()),
+        };
+        assert_eq!(effective_account_tier(&account), "trial");
+    }
+
+    #[test]
+    fn only_explicit_account_errors_are_fatal() {
+        let settings = CapacitySettings::default();
+        assert_eq!(
+            classify_account_failure("unauthenticated: invalid api key", &settings),
+            AccountFailureAction::FatalAccountError
+        );
+        assert_eq!(
+            classify_account_failure(
+                "permission_denied: subscription expired for this account",
+                &settings
+            ),
+            AccountFailureAction::FatalAccountError
+        );
+        assert_eq!(
+            classify_account_failure("permission_denied: request shape rejected", &settings),
+            AccountFailureAction::ReleaseOnly
+        );
+    }
+
+    #[test]
+    fn detects_probe_request_like_zephyrsail() {
+        let payload = MessagesRequest {
+            model: Some("claude-sonnet-4.6".to_string()),
+            stream: Some(false),
+            max_tokens: Some(1),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: Value::Null,
+            messages: json!([{ "role": "user", "content": "ping" }]),
+        };
+        assert!(is_probe_request(&payload));
+    }
+
+    #[test]
+    fn converts_anthropic_tool_blocks_to_engine_messages() {
+        let payload = MessagesRequest {
+            model: None,
+            stream: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            system: Some(json!("system text")),
+            tools: None,
+            tool_choice: None,
+            metadata: Value::Null,
+            messages: json!([
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "thinking", "thinking": "plan" },
+                        { "type": "tool_use", "id": "toolu_1", "name": "Read", "input": { "file_path": "a.rs" } }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "tool_result", "tool_use_id": "toolu_1", "content": [{ "type": "text", "text": "ok" }] }
+                    ]
+                }
+            ]),
+        };
+        let messages = messages_from_request(&payload);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].reasoning_content.as_deref(), Some("plan"));
+        assert_eq!(messages[1].tool_calls[0].name, "Read");
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("toolu_1"));
+    }
+
+    #[test]
+    fn anonymizes_tools_and_degrades_specific_tool_choice() {
+        let tools = vec![EngineTool {
+            name: "Read".to_string(),
+            description: Some("read file".to_string()),
+            parameters: Some(json!({ "type": "object", "additionalProperties": false })),
+        }];
+        let messages = vec![EngineMessage {
+            role: "assistant".to_string(),
+            tool_calls: vec![engine::EngineToolCall {
+                id: "toolu_1".to_string(),
+                name: "Read".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            ..Default::default()
+        }];
+        let isolation = isolate_tool_names(
+            tools,
+            messages,
+            EngineToolChoice::Function {
+                name: "Read".to_string(),
+            },
+            Vec::new(),
+            "client_tool",
+        )
+        .unwrap();
+        assert_ne!(isolation.tools[0].name, "Read");
+        assert_eq!(
+            restore_tool_name(&isolation.tools[0].name, &isolation.to_client_name),
+            "Read"
+        );
+        let degraded = degrade_tool_choice_for_upstream(
+            isolation.tool_choice,
+            isolation.messages,
+            &isolation.to_client_name,
+        );
+        assert!(matches!(degraded.tool_choice, EngineToolChoice::Auto));
+        assert_eq!(degraded.messages[0].role, "system");
+        assert!(degraded.messages[0].content.contains("Read"));
+    }
+
+    #[test]
+    fn extracts_claude_code_primary_working_directory() {
+        let messages = vec![
+            EngineMessage {
+                role: "system".to_string(),
+                content: "You are Claude Code.\n<env>\n- Primary working directory: /Users/wangshangbin/My/OpenSource/kiro-rs\n- Is git repo: true\n- Platform: darwin\n</env>"
+                    .to_string(),
+                ..Default::default()
+            },
+            EngineMessage {
+                role: "user".to_string(),
+                content: "看看项目".to_string(),
+                ..Default::default()
+            },
+        ];
+        let env = extract_caller_environment(&messages).unwrap();
+        assert!(env.contains("- Working directory: /Users/wangshangbin/My/OpenSource/kiro-rs"));
+        assert!(env.contains("- Is the directory a git repo: true"));
+        assert!(env.contains("- Platform: darwin"));
+    }
+
+    #[test]
+    fn sanitizes_anthropic_native_tools() {
+        let (tools, _) = sanitize_tools(Some(&json!([
+            {
+                "name": "Bash",
+                "description": "Run shell",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "command": { "type": "string", "description": "command" } },
+                    "additionalProperties": false
+                }
+            }
+        ])));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "Bash");
+        assert!(
+            tools[0]
+                .parameters
+                .as_ref()
+                .unwrap()
+                .get("additionalProperties")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn risk_clients_do_not_reinject_full_tool_documentation() {
+        let payload = MessagesRequest {
+            model: None,
+            stream: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            system: Some(json!("original system")),
+            tools: Some(json!([
+                {
+                    "name": "Bash",
+                    "description": "x".repeat(MAX_TOOL_DESCRIPTION_LEN + 100),
+                    "input_schema": { "type": "object" }
+                }
+            ])),
+            tool_choice: None,
+            metadata: Value::Null,
+            messages: json!([{ "role": "user", "content": "看看项目" }]),
+        };
+        let mut engine_messages = messages_from_request(&payload);
+        let (mut engine_tools, truncated_docs) = sanitize_tools(payload.tools.as_ref());
+        replace_system_prompt_for_tool_description_risk(&mut engine_messages);
+        shorten_tool_descriptions_for_risk_client(&mut engine_tools);
+        let isolation = isolate_tool_names(
+            engine_tools,
+            engine_messages,
+            EngineToolChoice::Auto,
+            truncated_docs,
+            DEFAULT_ANONYMOUS_TOOL_NAME_PREFIX,
+        )
+        .unwrap();
+        let degraded = degrade_tool_choice_for_upstream(
+            isolation.tool_choice,
+            isolation.messages,
+            &HashMap::new(),
+        );
+        let engine_messages = degraded.messages;
+        assert!(engine_messages.iter().any(|message| {
+            message.role == "system" && message.content == TOOL_DESCRIPTION_RISK_REPLACEMENT_SYSTEM
+        }));
+        assert!(
+            !engine_messages
+                .iter()
+                .any(|message| message.content.contains("<tool_documentation>"))
+        );
+    }
+
     #[tokio::test]
     async fn rejects_client_api_calls_when_no_enabled_key_exists() {
         let db = SqlitePoolOptions::new()
@@ -5798,7 +9170,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        run_migrations(&db).await.unwrap();
+        run_migrations(&db, &PathBuf::from(".data")).await.unwrap();
         let headers = HeaderMap::new();
         let err = require_client_api_key(&db, &headers, None)
             .await
