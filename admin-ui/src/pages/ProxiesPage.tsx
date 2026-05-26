@@ -3,6 +3,17 @@ import { PageHeader } from '../components/PageHeader';
 import { useToast } from '../components/Toast';
 import { ProxyItem, api } from '../lib/api';
 
+function proxyStatusText(value: string) {
+  const labels: Record<string, string> = {
+    ok: '可用',
+    ready: '可用',
+    unknown: '未检测',
+    error: '异常',
+    disabled: '已停用',
+  };
+  return labels[value] || '未检测';
+}
+
 export function ProxiesPage() {
   const [proxies, setProxies] = useState<ProxyItem[]>([]);
   const [name, setName] = useState('');
@@ -56,7 +67,7 @@ export function ProxiesPage() {
               <tr key={proxy.id}>
                 <td>{proxy.name}</td>
                 <td>{proxy.url}</td>
-                <td>{proxy.status}</td>
+                <td>{proxyStatusText(proxy.status)}</td>
                 <td>{proxy.lastError || '-'}</td>
               </tr>
             ))}

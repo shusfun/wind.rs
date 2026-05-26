@@ -1,7 +1,8 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { PageHeader } from '../components/PageHeader';
 import { StateBlock } from '../components/StateBlock';
-import { LoginJob, LoginJobEvent, api, getToken } from '../lib/api';
+import { LoginJob, LoginJobEvent, api, getToken, handleAuthResponse } from '../lib/api';
+import { eventTypeText, formatDateTime, jobStatusText } from '../lib/display';
 
 export function LoginJobsPage() {
   const [jobs, setJobs] = useState<LoginJob[]>([]);
@@ -13,7 +14,7 @@ export function LoginJobsPage() {
   const [error, setError] = useState('');
   const [activeJobId, setActiveJobId] = useState('');
   const [events, setEvents] = useState<LoginJobEvent[]>([]);
-  const [waiting, setWaiting] = useState<number | null>(null);
+  const [waiting, setWaiting] = useState<LoginJobEvent | null>(null);
 
   const lineCount = useMemo(() => text.split('\n').map((line) => line.trim()).filter(Boolean).length, [text]);
 
@@ -52,6 +53,10 @@ export function LoginJobsPage() {
     const resp = await fetch(`/admin/login-jobs/${id}/events`, {
       headers: { authorization: `Bearer ${getToken()}` },
     });
+    if (!resp.ok) {
+      handleAuthResponse(resp);
+      throw new Error(`读取进度失败：${resp.status}`);
+    }
     if (!resp.body) {
       return;
     }
@@ -71,7 +76,7 @@ export function LoginJobsPage() {
         const payload = JSON.parse(dataLine.slice(5)) as LoginJobEvent;
         if (eventType === 'close') return;
         if (eventType === 'waiting' && payload.seconds) {
-          setWaiting(payload.seconds);
+          setWaiting({ ...payload, type: eventType });
         } else {
           setWaiting(null);
         }
@@ -120,6 +125,7 @@ export function LoginJobsPage() {
                 <th>任务</th>
                 <th>状态</th>
                 <th>进度</th>
+                <th>创建时间</th>
                 <th></th>
               </tr>
             </thead>
@@ -131,10 +137,11 @@ export function LoginJobsPage() {
                       {job.id.slice(0, 8)}
                     </button>
                   </td>
-                  <td>{job.status}</td>
+                  <td>{jobStatusText(job.status)}</td>
                   <td>
                     {job.successCount + job.failedCount}/{job.total}
                   </td>
+                  <td>{formatDateTime(job.createdAt)}</td>
                   <td>
                     {job.status === 'running' ? (
                       <button className="text-button" type="button" onClick={() => cancel(job.id)}>
@@ -150,15 +157,16 @@ export function LoginJobsPage() {
       </section>
       <section className="panel job-events">
         <h2>实时进度 {activeJobId ? activeJobId.slice(0, 8) : ''}</h2>
-        {waiting != null ? <StateBlock message={`正在等待 ${waiting} 秒后继续。`} /> : null}
+        {waiting ? <StateBlock message={`${waiting.reason === 'failed' ? '失败后继续' : '稍后继续'}，剩余 ${waiting.seconds || 0} 秒。`} /> : null}
         {events.length === 0 ? <StateBlock message="创建或选择一个任务后查看进度。" /> : null}
         <div className="event-list">
           {events.map((event, index) => (
-            <article className={`event-item event-${event.type}`} key={`${event.type}-${index}`}>
-              <strong>{event.type}</strong>
-              <span>{event.emailMasked || event.message || event.errorCode || '-'}</span>
-              {event.index ? <small>第 {event.index} 行</small> : null}
-            </article>
+              <article className={`event-item event-${event.type}`} key={`${event.type}-${index}`}>
+                <strong>{eventTypeText(event.type)}</strong>
+                <span>{event.emailMasked || event.message || event.errorCode || '-'}</span>
+                {event.waitingUntil ? <small>{formatDateTime(event.waitingUntil)}</small> : null}
+                {event.index ? <small>第 {event.index} 行</small> : null}
+              </article>
           ))}
         </div>
       </section>

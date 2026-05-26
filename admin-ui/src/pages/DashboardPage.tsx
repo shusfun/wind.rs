@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { PageHeader } from '../components/PageHeader';
 import { StateBlock } from '../components/StateBlock';
 import { api, Account, LoginJob, RequestTrace } from '../lib/api';
+import { formatDateTime, jobStatusText } from '../lib/display';
 
 export function DashboardPage() {
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -54,6 +55,7 @@ export function DashboardPage() {
             <tr>
               <th>任务</th>
               <th>状态</th>
+              <th>创建时间</th>
               <th>成功</th>
               <th>失败</th>
             </tr>
@@ -62,7 +64,8 @@ export function DashboardPage() {
             {jobs.slice(0, 6).map((job) => (
               <tr key={job.id}>
                 <td>{job.id.slice(0, 8)}</td>
-                <td>{job.status}</td>
+                <td>{jobStatusText(job.status)}</td>
+                <td>{formatDateTime(job.createdAt)}</td>
                 <td>{job.successCount}</td>
                 <td>{job.failedCount}</td>
               </tr>

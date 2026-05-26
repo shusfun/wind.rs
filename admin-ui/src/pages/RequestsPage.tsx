@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { PageHeader } from '../components/PageHeader';
 import { StateBlock } from '../components/StateBlock';
 import { RequestTrace, TraceChunk, api } from '../lib/api';
+import { formatDateTime, requestStatusText } from '../lib/display';
 
 export function RequestsPage() {
   const [requests, setRequests] = useState<RequestTrace[]>([]);
@@ -34,6 +35,7 @@ export function RequestsPage() {
                 <th>请求</th>
                 <th>模型</th>
                 <th>状态</th>
+                <th>开始时间</th>
                 <th>结束原因</th>
               </tr>
             </thead>
@@ -42,7 +44,8 @@ export function RequestsPage() {
                 <tr key={item.id} className={selected === item.id ? 'selected-row' : ''} onClick={() => open(item.id)}>
                   <td>{item.id.slice(0, 8)}</td>
                   <td>{item.model || '-'}</td>
-                  <td>{item.status}</td>
+                  <td>{requestStatusText(item.status)}</td>
+                  <td>{formatDateTime(item.startedAt)}</td>
                   <td>{item.endReason || '-'}</td>
                 </tr>
               ))}
@@ -56,6 +59,7 @@ export function RequestsPage() {
             {chunks.map((chunk) => (
               <article key={chunk.id} className="trace-item">
                 <strong>{chunk.layer}</strong>
+                <small>{formatDateTime(chunk.createdAt)}</small>
                 <pre>{chunk.payload}</pre>
               </article>
             ))}

@@ -1,10 +1,10 @@
 import { NavLink, Navigate, Route, Routes, useNavigate } from 'react-router-dom';
+import { useEffect } from 'react';
 import type { ReactNode } from 'react';
 import {
   Activity,
   BarChart3,
   Cable,
-  Gauge,
   HeartPulse,
   KeyRound,
   LayoutDashboard,
@@ -17,13 +17,17 @@ import {
 import { clearToken, getToken } from './lib/api';
 import { ToastProvider } from './components/Toast';
 import { AccountsPage } from './pages/AccountsPage';
+import { BansPage } from './pages/BansPage';
 import { ClientApiKeysPage } from './pages/ClientApiKeysPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { LoginPage } from './pages/LoginPage';
+import { ModelsPage } from './pages/ModelsPage';
 import { ProxiesPage } from './pages/ProxiesPage';
 import { RequestsPage } from './pages/RequestsPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { SetupPage } from './pages/SetupPage';
+import { StatsPage } from './pages/StatsPage';
+import { authExpiredEventName } from './lib/api';
 
 function RequireLogin({ children }: { children: ReactNode }) {
   return getToken() ? children : <Navigate to="/login" replace />;
@@ -56,30 +60,20 @@ const navGroups = [
   },
 ];
 
-function PlaceholderPage({ title, subtitle }: { title: string; subtitle: string }) {
-  return (
-    <>
-      <header className="page-header">
-        <div>
-          <h1>{title}</h1>
-          <p>{subtitle}</p>
-        </div>
-      </header>
-      <section className="panel empty-panel">
-        <Gauge size={34} />
-        <strong>稍后在这里查看</strong>
-        <span>当前先完成账号管理和调用排查，其他页面会按这个界面结构补齐。</span>
-      </section>
-    </>
-  );
-}
-
 function Shell() {
   const navigate = useNavigate();
   const logout = () => {
     clearToken();
     navigate('/login', { replace: true });
   };
+
+  useEffect(() => {
+    const onAuthExpired = () => {
+      navigate('/login', { replace: true });
+    };
+    window.addEventListener(authExpiredEventName, onAuthExpired);
+    return () => window.removeEventListener(authExpiredEventName, onAuthExpired);
+  }, [navigate]);
 
   return (
     <ToastProvider>
@@ -116,10 +110,10 @@ function Shell() {
         <main className="main-panel">
           <Routes>
             <Route path="/dashboard" element={<DashboardPage />} />
-            <Route path="/stats" element={<PlaceholderPage title="统计分析" subtitle="查看请求量、成功率和账号使用情况。" />} />
+            <Route path="/stats" element={<StatsPage />} />
             <Route path="/accounts" element={<AccountsPage />} />
-            <Route path="/bans" element={<PlaceholderPage title="异常监测" subtitle="查看需要处理的账号和最近失败原因。" />} />
-            <Route path="/models" element={<PlaceholderPage title="模型控制" subtitle="配置可使用的模型范围。" />} />
+            <Route path="/bans" element={<BansPage />} />
+            <Route path="/models" element={<ModelsPage />} />
             <Route path="/client-api-keys" element={<ClientApiKeysPage />} />
             <Route path="/requests" element={<RequestsPage />} />
             <Route path="/proxies" element={<ProxiesPage />} />

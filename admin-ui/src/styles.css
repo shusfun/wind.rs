@@ -24,11 +24,11 @@
   html,
   body,
   #root {
-    @apply min-h-full bg-bg text-text-main antialiased;
+    @apply h-full bg-bg text-text-main antialiased;
   }
 
   body {
-    @apply m-0 min-w-80 font-sans;
+    @apply m-0 min-w-80 overflow-hidden font-sans;
   }
 
   button,
@@ -78,11 +78,11 @@
 
 @layer components {
   .shell {
-    @apply grid min-h-screen grid-cols-[232px_minmax(0,1fr)] bg-bg;
+    @apply grid h-screen min-h-0 grid-cols-[232px_minmax(0,1fr)] overflow-hidden bg-bg;
   }
 
   .sidebar {
-    @apply sticky top-0 flex min-h-screen flex-col border-r border-border-soft bg-surface text-text-main;
+    @apply flex min-h-0 flex-col overflow-hidden border-r border-border-soft bg-surface text-text-main;
   }
 
   .brand {
@@ -136,7 +136,7 @@
   }
 
   .main-panel {
-    @apply min-w-0 px-9 py-7;
+    @apply min-h-0 min-w-0 overflow-auto px-9 py-7;
   }
 
   .page-header {
@@ -158,7 +158,7 @@
   }
 
   .panel {
-    @apply overflow-auto p-4;
+    @apply min-w-0 overflow-auto p-4;
   }
 
   .panel h2,
@@ -174,12 +174,31 @@
     @apply p-4;
   }
 
+  .metric-card svg {
+    @apply mb-2 text-text-muted;
+  }
+
   .metric-card span {
     @apply block text-xs text-text-muted;
   }
 
   .metric-card strong {
     @apply mt-2 block text-3xl tracking-normal;
+  }
+
+  .metric-card strong.success,
+  .rate-pill.success {
+    @apply text-success;
+  }
+
+  .metric-card strong.warn,
+  .rate-pill.warn {
+    @apply text-warn;
+  }
+
+  .metric-card strong.danger,
+  .rate-pill.danger {
+    @apply text-danger;
   }
 
   .two-column {
@@ -345,6 +364,10 @@
 
   .event-success {
     @apply border-success/35 bg-success/15;
+  }
+
+  .event-skipped {
+    @apply border-border-strong bg-surface-2;
   }
 
   .event-progress {
@@ -871,6 +894,10 @@
     @apply border-warn/35 bg-warn/10 text-warn;
   }
 
+  .job-waiting-line {
+    @apply rounded-md border border-warn/35 bg-warn/10 px-3 py-2 text-xs font-bold text-warn;
+  }
+
   .current-account-line {
     @apply grid grid-cols-[72px_minmax(0,1fr)_auto] items-center gap-2 rounded-md border border-border-soft bg-surface px-3 py-2.5;
   }
@@ -949,8 +976,141 @@
     @apply min-h-30 resize-y rounded-md border border-border-soft bg-surface px-3 py-2 font-mono text-sm text-text-main outline-none focus:border-accent;
   }
 
+  .setting-option-hints {
+    @apply grid grid-cols-3 gap-2;
+  }
+
+  .setting-option-hints span {
+    @apply grid gap-1 rounded-md border border-border-soft bg-surface px-3 py-2 text-xs leading-5 text-text-muted;
+  }
+
+  .setting-option-hints span.active {
+    @apply border-accent/60 bg-accent/10 text-text-main;
+  }
+
+  .setting-option-hints strong {
+    @apply text-text-main;
+  }
+
   .api-key-table-panel {
     @apply p-0;
+  }
+
+  .range-tabs {
+    @apply mb-4 inline-flex rounded-md border border-border-soft bg-bg-elev p-0.75;
+  }
+
+  .range-tabs button {
+    @apply rounded px-3.5 py-1.5 text-xs font-extrabold text-text-muted hover:bg-surface-3 hover:text-text-main;
+  }
+
+  .range-tabs button.active {
+    @apply bg-surface-3 text-text-main;
+  }
+
+  .stats-grid {
+    @apply grid grid-cols-2 gap-4;
+  }
+
+  .chart-grid {
+    @apply mb-4 grid grid-cols-2 gap-4;
+  }
+
+  .chart-panel {
+    @apply grid gap-3 overflow-hidden;
+  }
+
+  .chart-panel.wide {
+    @apply col-span-2;
+  }
+
+  .chart-box {
+    @apply h-80 min-w-0;
+  }
+
+  .chart-box.compact {
+    @apply h-72;
+  }
+
+  .stat-panel {
+    @apply grid gap-3;
+  }
+
+  .rate-pill {
+    @apply inline-flex rounded-full bg-surface-2 px-2 py-1 text-xs font-black;
+  }
+
+  .rank-list {
+    @apply grid gap-2;
+  }
+
+  .rank-list article {
+    @apply grid grid-cols-[48px_minmax(0,1fr)] gap-3 rounded-md border border-border-soft bg-bg-elev px-3 py-2.5;
+  }
+
+  .rank-list strong {
+    @apply text-lg text-danger;
+  }
+
+  .rank-list span {
+    @apply min-w-0 break-words text-xs leading-5 text-text-muted;
+  }
+
+  .status-summary {
+    @apply grid grid-cols-2 gap-3;
+  }
+
+  .status-summary div {
+    @apply rounded-md border border-border-soft bg-bg-elev p-3;
+  }
+
+  .status-summary span {
+    @apply block text-xs text-text-muted;
+  }
+
+  .status-summary strong {
+    @apply mt-2 block text-2xl text-text-main;
+  }
+
+  .model-control-bar {
+    @apply grid grid-cols-[minmax(180px,240px)_minmax(260px,1fr)_auto] items-end gap-3 rounded-[10px] border border-border-soft bg-surface p-4;
+  }
+
+  .model-control-bar > div {
+    @apply grid grid-cols-[auto_1fr_auto] items-center gap-2.5 rounded-md border border-border-soft bg-bg-elev px-3 py-2.5 text-text-muted;
+  }
+
+  .model-control-bar strong {
+    @apply text-xl text-text-main;
+  }
+
+  .models-panel,
+  .issue-panel {
+    @apply p-0;
+  }
+
+  .model-name-cell {
+    @apply grid min-w-0 gap-1;
+  }
+
+  .model-name-cell strong {
+    @apply min-w-0 truncate text-sm text-text-main;
+  }
+
+  .model-name-cell span {
+    @apply min-w-0 break-words font-mono text-[11px] text-text-dim;
+  }
+
+  .model-name-cell small {
+    @apply w-fit rounded border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] font-bold text-accent-hover;
+  }
+
+  .switch-row {
+    @apply inline-flex w-auto grid-cols-none items-center gap-2 text-xs font-bold text-text-muted;
+  }
+
+  .switch-row input {
+    @apply h-4 w-4 rounded border-border-strong accent-accent;
   }
 
   .api-key-modal {
@@ -1001,10 +1161,14 @@
 @layer utilities {
   @media (max-width: 1080px) {
     .account-toolbar,
-    .metric-grid,
-    .field-grid.compact,
+	    .metric-grid,
+	    .stats-grid,
+	    .chart-grid,
+	    .model-control-bar,
+	    .field-grid.compact,
     .job-progress-panel,
-    .job-columns {
+    .job-columns,
+    .setting-option-hints {
       @apply grid-cols-2;
     }
 
@@ -1017,27 +1181,39 @@
     }
   }
 
-  @media (max-width: 760px) {
-    .shell,
+	  @media (max-width: 760px) {
+    body {
+      @apply overflow-auto;
+    }
+
+	    .shell,
     .two-column,
     .two-column.wide,
-    .metric-grid,
-    .inline-form,
+	    .metric-grid,
+	    .stats-grid,
+	    .chart-grid,
+	    .model-control-bar,
+	    .inline-form,
     .field-grid,
     .field-grid.compact,
     .account-toolbar,
     .job-progress-panel,
     .job-columns,
-    .detail-grid {
+    .detail-grid,
+    .setting-option-hints {
       @apply grid-cols-1;
     }
 
     .sidebar {
-      @apply static min-h-0;
+      @apply static min-h-0 overflow-visible;
     }
 
     .main-panel {
-      @apply p-5;
+      @apply overflow-visible p-5;
+    }
+
+    .chart-panel.wide {
+      @apply col-span-1;
     }
 
     .modal-backdrop {

@@ -21,7 +21,8 @@ import { PageHeader } from '../components/PageHeader';
 import { SecretInput } from '../components/SecretInput';
 import { StateBlock } from '../components/StateBlock';
 import { StatusBadge } from '../components/StatusBadge';
-import { Account, AdminEvent, LoginJob, LoginJobEvent, api, authHeaders, getToken } from '../lib/api';
+import { Account, AdminEvent, LoginJob, LoginJobEvent, api, authHeaders, getToken, handleAuthResponse } from '../lib/api';
+import { formatDateTime, formatEpochSeconds, formatRelativeFromMs, formatShortDateTime } from '../lib/display';
 
 type AddMode = 'password' | 'batch' | 'token' | 'apiKey';
 type ProbeModelOption = { id: string; label?: string };
@@ -33,30 +34,12 @@ const addModes: Array<{ key: AddMode; label: string }> = [
   { key: 'apiKey', label: 'API Key' },
 ];
 
-function formatTime(value?: string | null) {
-  return value ? new Date(value).toLocaleString() : '-';
-}
-
 function formatPercent(value?: number | null) {
   return typeof value === 'number' ? `${Math.max(0, Math.min(100, value)).toFixed(0)}%` : 'N/A';
 }
 
 function clampPercent(value?: number | null) {
   return typeof value === 'number' ? Math.max(0, Math.min(100, value)) : null;
-}
-
-function formatAgoFromMs(value?: number | null) {
-  if (!value) return '-';
-  const minutes = Math.max(0, Math.round((Date.now() - value) / 60000));
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 48) return `${hours}h ago`;
-  return `${Math.round(hours / 24)}d ago`;
-}
-
-function formatShortTime(value?: string | null) {
-  if (!value) return '-';
-  return new Date(value).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
 function modelId(model: string | { id: string }) {
@@ -136,7 +119,7 @@ function availabilityClass(account: Account) {
 
 function availabilityDetail(account: Account) {
   const availability = account.availability;
-  if (!availability) return account.rateLimited ? formatShortTime(account.rateLimitedUntil) : '调度可用';
+  if (!availability) return account.rateLimited ? formatShortDateTime(account.rateLimitedUntil) : '调度可用';
   if (availability.available) return availability.kind === 'probing' ? '正在尝试恢复' : '调度可用';
   if (availability.retryAfterSecs > 0) return `${availability.retryAfterSecs}s 后再试`;
   return '暂不可用';
@@ -145,6 +128,7 @@ function availabilityDetail(account: Account) {
 function tierText(value?: string | null) {
   const labels: Record<string, string> = {
     pro: 'PRO',
+    trial: 'TRIAL',
     free: 'FREE',
     expired: '已过期',
     unknown: '未知',
@@ -185,6 +169,7 @@ function jobStatusText(value: string) {
 function eventTitle(event: LoginJobEvent) {
   if (event.type === 'progress') return '开始处理';
   if (event.type === 'success') return '添加成功';
+  if (event.type === 'skipped') return '已跳过';
   if (event.type === 'failed') return '添加失败';
   if (event.type === 'waiting') return '等待下一次';
   return eventStatusText(event.type);
@@ -192,11 +177,12 @@ function eventTitle(event: LoginJobEvent) {
 
 function eventMessage(event: LoginJobEvent) {
   if (event.type === 'waiting') {
-    const reason = event.reason === 'failed' ? '失败后等待' : '成功后等待';
+    const reason = event.reason === 'failed' ? '失败后继续' : '稍后继续';
     return `${reason} ${event.seconds || 0} 秒`;
   }
   if (event.type === 'progress') return `正在处理 ${eventText(event)}`;
-  if (event.type === 'success') return `${eventText(event)} 已添加`;
+  if (event.type === 'success') return event.message || `${eventText(event)} 已添加`;
+  if (event.type === 'skipped') return event.message || `${eventText(event)} 已跳过`;
   if (event.type === 'failed') return `${eventText(event)} ${event.message || event.errorCode || '导入失败'}`;
   if (event.type === 'cancelled') return event.message || '任务已停止';
   if (event.type === 'done') return `成功 ${event.successCount || 0} 个，失败 ${event.failedCount || 0} 个`;
@@ -274,13 +260,6 @@ function modelStats(account: Account) {
   };
 }
 
-function creditResetText(value?: number | string | null) {
-  if (value == null || value === '') return '无重置时间';
-  const parsed = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) return '无重置时间';
-  return new Date(parsed * 1000).toLocaleString();
-}
-
 function creditTone(value?: number | null) {
   const pct = clampPercent(value);
   if (pct == null) return 'none';
@@ -293,7 +272,7 @@ function CreditMeter({ label, value, resetAt }: { label: string; value?: number 
   const pct = clampPercent(value);
   const noData = pct == null;
   return (
-    <div className={`credit-meter ${noData ? 'empty' : creditTone(pct)}`} title={noData ? `${label}额度未返回` : `${label}剩余 ${pct.toFixed(0)}%，重置时间：${creditResetText(resetAt)}`}>
+    <div className={`credit-meter ${noData ? 'empty' : creditTone(pct)}`} title={noData ? `${label}额度未返回` : `${label}剩余 ${pct.toFixed(0)}%，重置时间：${formatEpochSeconds(resetAt)}`}>
       <span>{label}</span>
       <div className="credit-track">
         <i style={{ width: `${noData ? 0 : pct}%` }} />
@@ -314,7 +293,7 @@ function CreditSummary({ account }: { account: Account }) {
     <div className="credit-summary">
       <div className="credit-plan-line">
         <strong title={planName}>{planName.length > 12 ? `${planName.slice(0, 12)}...` : planName}</strong>
-        <span>{formatAgoFromMs(credits.fetchedAt)}</span>
+        <span>{formatRelativeFromMs(credits.fetchedAt)}</span>
       </div>
       <CreditMeter label="日" value={credits.dailyPercent} resetAt={credits.dailyResetAt} />
       <CreditMeter label="周" value={credits.weeklyPercent} resetAt={credits.weeklyResetAt} />
@@ -342,6 +321,7 @@ function useAdminEvents(enabled: boolean, onEvent: (event: AdminEvent) => void, 
           signal: controller.signal,
         });
         if (!resp.ok || !resp.body) {
+          handleAuthResponse(resp);
           throw new Error(`实时连接失败：${resp.status}`);
         }
         const reader = resp.body.getReader();
@@ -381,7 +361,7 @@ function useLoginJobs(enabled: boolean, onAccountsChanged: () => Promise<void>) 
   const [jobs, setJobs] = useState<LoginJob[]>([]);
   const [activeJobId, setActiveJobId] = useState('');
   const [events, setEvents] = useState<LoginJobEvent[]>([]);
-  const [waiting, setWaiting] = useState<number | null>(null);
+  const [waiting, setWaiting] = useState<LoginJobEvent | null>(null);
   const [jobError, setJobError] = useState('');
 
   async function loadJobs() {
@@ -396,6 +376,10 @@ function useLoginJobs(enabled: boolean, onAccountsChanged: () => Promise<void>) 
     const resp = await fetch(`/admin/login-jobs/${id}/events`, {
       headers: { authorization: `Bearer ${getToken()}` },
     });
+    if (!resp.ok) {
+      handleAuthResponse(resp);
+      throw new Error(`读取进度失败：${resp.status}`);
+    }
     if (!resp.body) return;
 
     const reader = resp.body.getReader();
@@ -417,7 +401,7 @@ function useLoginJobs(enabled: boolean, onAccountsChanged: () => Promise<void>) 
           await Promise.all([loadJobs(), onAccountsChanged()]);
           return;
         }
-        setWaiting(eventType === 'waiting' && payload.seconds ? payload.seconds : null);
+        setWaiting(eventType === 'waiting' && payload.seconds ? { ...payload, type: eventType } : null);
         setEvents((current) => [...current, { ...payload, type: eventType }].slice(-200));
       }
     }
@@ -700,6 +684,12 @@ function LoginJobPanel({
   const progress = jobProgress(activeJob);
   const latestEvent = latestAccountEvent(events);
   const running = activeJob?.status === 'running';
+  const waitingSeconds = waiting?.seconds || 0;
+  const waitingText = waiting
+    ? waiting.reason === 'failed'
+      ? `失败后等待 ${waitingSeconds} 秒`
+      : `稍后继续处理，剩余 ${waitingSeconds} 秒`
+    : '';
 
   useEffect(() => {
     eventListRef.current?.scrollTo({ top: eventListRef.current.scrollHeight });
@@ -733,8 +723,8 @@ function LoginJobPanel({
             <span>成功 {activeJob?.successCount || 0}</span>
             <span>失败 {activeJob?.failedCount || 0}</span>
             <span>等待 {activeJob ? Math.max(0, activeJob.total - doneCount) : 0}</span>
-            {waiting != null ? <span className="waiting">继续前等待 {waiting} 秒</span> : null}
           </div>
+          {waiting ? <div className="job-waiting-line">{waitingText}</div> : null}
         </div>
       </div>
 
@@ -1328,7 +1318,7 @@ export function AccountsPage() {
                             <span style={{ width: `${rpmPct}%` }} />
                           </div>
                         </div>
-                        <span className="muted-text">最近 {formatShortTime(account.lastUsed)}</span>
+                        <span className="muted-text">最近 {formatShortDateTime(account.lastUsed)}</span>
                       </div>
                     </td>
                     <td>
@@ -1401,11 +1391,11 @@ export function AccountsPage() {
                             </div>
                             <div>
                               <span>最近登录</span>
-                              <strong>{formatTime(account.lastLoginAt)}</strong>
+                              <strong>{formatDateTime(account.lastLoginAt)}</strong>
                             </div>
                             <div>
                               <span>最近探测</span>
-                              <strong>{formatTime(account.lastProbed)}</strong>
+                              <strong>{formatDateTime(account.lastProbed)}</strong>
                             </div>
                             <div>
                               <span>最近错误</span>
@@ -1413,11 +1403,11 @@ export function AccountsPage() {
                             </div>
                             <div>
                               <span>添加时间</span>
-                              <strong>{formatTime(account.createdAt)}</strong>
+                              <strong>{formatDateTime(account.createdAt)}</strong>
                             </div>
                             <div>
                               <span>更新时间</span>
-                              <strong>{formatTime(account.updatedAt)}</strong>
+                              <strong>{formatDateTime(account.updatedAt)}</strong>
                             </div>
                           </div>
                           <div className="model-list">

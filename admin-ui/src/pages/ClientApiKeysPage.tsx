@@ -2,10 +2,7 @@ import { FormEvent, useEffect, useState } from 'react';
 import { Check, KeyRound, Plus, Trash2, X } from 'lucide-react';
 import { useToast } from '../components/Toast';
 import { ClientApiKey, api } from '../lib/api';
-
-function formatTime(value?: string | null) {
-  return value ? new Date(value).toLocaleString() : '-';
-}
+import { formatDateTime } from '../lib/display';
 
 export function ClientApiKeysPage() {
   const [keys, setKeys] = useState<ClientApiKey[]>([]);
@@ -168,8 +165,8 @@ export function ClientApiKeysPage() {
                   <td>
                     <span className={item.enabled ? 'status-badge' : 'status-badge status-disabled'}>{item.enabled ? '可用' : '已停用'}</span>
                   </td>
-                  <td>{formatTime(item.lastUsedAt)}</td>
-                  <td>{formatTime(item.createdAt)}</td>
+                  <td>{formatDateTime(item.lastUsedAt)}</td>
+                  <td>{formatDateTime(item.createdAt)}</td>
                   <td>
                     <div className="row-actions">
                       <button className="text-button" disabled={busy === `enabled-${item.id}`} type="button" onClick={() => setEnabled(item, !item.enabled)}>

@@ -124,6 +124,12 @@ export type CapacitySettings = {
   stickySessionMinutes: number;
 };
 
+export type SystemPromptMode = 'passthrough' | 'strip-identity' | 'windsurf-wrap';
+
+export type AdminSettings = {
+  systemPromptMode: SystemPromptMode;
+};
+
 export type CapacityRuntime = {
   globalInflight: number;
   models: Array<{ model: string; inflight: number }>;
@@ -166,6 +172,7 @@ export type LoginJobEvent = {
   retryAfterSecs?: number | null;
   seconds?: number;
   reason?: string;
+  waitingUntil?: string;
   successCount?: number;
   failedCount?: number;
 };
@@ -197,6 +204,42 @@ export type ModelListItem = {
   _windsurf?: AccountModel;
 };
 
+export type StatsRangeKey = '24h' | '7d' | '30d';
+
+export type AdminStats = {
+  range: { key: StatsRangeKey; label: string; since: string };
+  overview: {
+    requests: number;
+    succeeded: number;
+    failed: number;
+    running: number;
+    successRate: number;
+    avgLatencyMs: number;
+    accounts: number;
+    availableAccounts: number;
+    issueAccounts: number;
+  };
+  models: Array<{ model: string; requests: number; succeeded: number; failed: number; successRate: number }>;
+  accounts: Array<{ accountId: number; name: string; requests: number; failed: number; successRate: number; lastError?: string | null }>;
+  errors: Array<{ message: string; count: number }>;
+  accountStates: Array<{ id: number; name: string; status: string; rateLimited: boolean; errorCount: number; lastError?: string | null }>;
+  loginJobs: { total: number; running: number; succeeded: number; failed: number };
+  timeline: Array<{ label: string; requests: number; succeeded: number; failed: number }>;
+};
+
+export type AdminModelControlItem = AccountModel & {
+  enabled: boolean;
+  accountCount: number;
+  limitedAccountCount: number;
+  recentFailures: number;
+};
+
+export type AdminModelConfig = {
+  defaultModel: string;
+  disabledModels: string[];
+  models: AdminModelControlItem[];
+};
+
 export type ClientApiKey = {
   id: number;
   name: string;
@@ -207,6 +250,8 @@ export type ClientApiKey = {
   updatedAt: string;
   lastUsedAt?: string | null;
 };
+
+export const authExpiredEventName = 'windsurf-rs-auth-expired';
 
 export function getToken() {
   return localStorage.getItem('windsurf_rs_token') || '';
@@ -224,6 +269,17 @@ export function authHeaders() {
   return { authorization: `Bearer ${getToken()}` };
 }
 
+export function notifyAuthExpired() {
+  clearToken();
+  window.dispatchEvent(new Event(authExpiredEventName));
+}
+
+export function handleAuthResponse(resp: Response) {
+  if (resp.status === 401 || resp.status === 403) {
+    notifyAuthExpired();
+  }
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (!headers.has('content-type') && init.body) {
@@ -235,6 +291,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   const resp = await fetch(path, { ...init, headers });
   if (!resp.ok) {
+    handleAuthResponse(resp);
     let message = `请求失败：${resp.status}`;
     try {
       const body = (await resp.json()) as ApiErrorBody;
@@ -299,6 +356,9 @@ export const api = {
       },
       body: JSON.stringify(payload),
       signal,
+    }).then((resp) => {
+      if (!resp.ok) handleAuthResponse(resp);
+      return resp;
     }),
   refreshAccountsStatus: () => envelope<{ results: unknown[] }>('/admin/accounts/refresh-status', { method: 'POST' }),
   refreshAccountCredits: (id: number) => envelope<Record<string, unknown>>(`/admin/accounts/${id}/refresh-credits`, { method: 'POST' }),
@@ -340,14 +400,21 @@ export const api = {
   deleteClientApiKey: (id: number) => envelope<Record<string, never>>(`/admin/client-api-keys/${id}`, { method: 'DELETE' }),
   requests: () => envelope<{ requests: RequestTrace[] }>('/admin/requests'),
   requestDetail: (id: string) => envelope<{ request: RequestTrace; chunks: TraceChunk[] }>(`/admin/requests/${id}`),
+  stats: (range: StatsRangeKey) => envelope<AdminStats>(`/admin/stats?range=${encodeURIComponent(range)}`),
+  modelConfig: () => envelope<AdminModelConfig>('/admin/models/config'),
+  saveModelConfig: (payload: { defaultModel: string; disabledModels: string[] }) =>
+    envelope<AdminModelConfig>('/admin/models/config', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
   capacity: () => envelope<{ settings: CapacitySettings; runtime: CapacityRuntime }>('/admin/capacity'),
   saveCapacity: (payload: CapacitySettings) =>
     envelope<{ settings: CapacitySettings }>('/admin/capacity', {
       method: 'PUT',
       body: JSON.stringify(payload),
     }),
-  settings: () => envelope<Record<string, string>>('/admin/settings'),
-  saveSettings: (payload: Record<string, string>) =>
+  settings: () => envelope<AdminSettings>('/admin/settings'),
+  saveSettings: (payload: AdminSettings) =>
     envelope<Record<string, never>>('/admin/settings', {
       method: 'PUT',
       body: JSON.stringify(payload),
