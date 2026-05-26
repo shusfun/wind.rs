@@ -5,6 +5,7 @@
 !.env.example
 
 target/
+.data/
 *.sqlite3
 *.db
 *.log
