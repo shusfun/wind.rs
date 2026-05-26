@@ -17,3 +17,20 @@ admin-ui/tsconfig.tsbuildinfo
 .tmp/*
 
 WindsurfAPI/
+
+# 本地兼容性验证脚本和临时报告
+[0-9][0-9]-*.mjs
+afterPack.cjs
+ai-sdk-openai-compat-chat.ts
+anthropic-curl-test.ps1
+assert.mjs
+build-describer-template.cjs
+fixtures.mjs
+http.mjs
+index.js
+last-report.json
+package.json
+protect.mjs
+run.mjs
+runner.mjs
+sse.mjs
